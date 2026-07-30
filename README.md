@@ -1,4 +1,4 @@
-# Kubernetes 1.33 实验集群（Master + VIP + HAProxy/Keepalived + Worker）
+## Kubernetes 1.33 实验集群（Master + VIP + HAProxy/Keepalived + Worker）
 
 使用 `install-k8s-1.33.sh` 在 Ubuntu 24.04 上搭建 **kubeadm + containerd** 的 **1.33**。
 
@@ -21,9 +21,9 @@
 
 
 
-## 推荐安装总览
+### 推荐安装总览
 
-### 步骤顺序
+#### 步骤顺序
 
 ```text
 1. 填 k8s-nodes.conf
@@ -36,7 +36,7 @@
 8. status 检查；导入 Kuboard
 ```
 
-### 脚本命令总结（按顺序）
+#### 脚本命令总结（按顺序）
 
 ```bash
 # —— 每台 master/worker ——
@@ -65,7 +65,7 @@ sudo bash install-k8s-1.33.sh status
 
 查看帮助：`bash install-k8s-1.33.sh --help`
 
-### 命令一览
+#### 命令一览
 
 | 命令 | 在哪执行 | 作用 |
 |------|----------|------|
@@ -113,7 +113,7 @@ sudo bash install-k8s-1.33.sh status
 | `join-workers` | `--prepare` / `--only=<IP>` / `--dry-run` | 含义同上（无 vip 相关参数） |
 | `join-all` | `--prepare` 等 | 传给 `join-masters` / `join-workers`；另支持 `--masters-only` / `--workers-only` |
 
-### 常用环境变量
+#### 常用环境变量
 
 | 变量 | 默认（摘要） | 说明 |
 |------|--------------|------|
@@ -143,7 +143,7 @@ sudo -E bash install-k8s-1.33.sh cni-calico
 
 
 
-## 1. 地址规划（可配置多台）
+### 1. 地址规划（可配置多台）
 
 节点表：同目录 `k8s-nodes.conf`（也可用环境变量 `K8S_NODES`）。
 
@@ -173,7 +173,7 @@ bash install-k8s-1.33.sh nodes    # 查看（不显示密码）
 
 
 
-## 2. 所有节点：prepare（含 hosts）
+### 2. 所有节点：prepare（含 hosts）
 
 在 **每一台** master / worker 上（或先拷脚本再执行）：
 
@@ -190,7 +190,7 @@ sudo bash install-k8s-1.33.sh hosts
 
 
 
-### 2.1 节点 SSH 免密
+#### 2.1 节点 SSH 免密
 
 在 `k8s-nodes.conf` 填好各 **master/worker** 的 `用户名|密码` 后，在管理机（通常 m1）执行：
 
@@ -209,7 +209,7 @@ ssh root@k8s-m2
 
 
 
-## 3. VIP 搭建（HAProxy + Keepalived）— 全部 Master
+### 3. VIP 搭建（HAProxy + Keepalived）— 全部 Master
 
 **必须在** `kubeadm init` **之前完成**；Worker 不装 VIP。
 
@@ -246,7 +246,7 @@ sudo bash install-k8s-1.33.sh vip --iface=<网卡名> --priority=100
 
 
 
-## 4. 仅 Master-1：脚本 init
+### 4. 仅 Master-1：脚本 init
 
 **只在第一台 Master（如 172.16.10.115 / k8s-m1）执行一次**，不要在其它节点 init。
 
@@ -276,7 +276,7 @@ kubectl get nodes -o wide
 
 
 
-## 5. 安装网络插件（CNI）
+### 5. 安装网络插件（CNI）
 
 `kubeadm init` 之后 **必须安装 CNI**，否则节点一直 `NotReady`，Pod 也起不来。  
 **建议在 join 其它节点之前**先在 Master-1 装好。本指南默认使用 **Calico**。
@@ -304,7 +304,7 @@ kubectl get nodes -o wide
 
 
 
-### 5.2 常见现象
+#### 5.2 常见现象
 
 
 | 现象                            | 说明                                                      |
@@ -318,7 +318,7 @@ kubectl get nodes -o wide
 
 
 
-## 6. 脚本加入其余 Master / Worker
+### 6. 脚本加入其余 Master / Worker
 
 在 **已 init 且已装 CNI 的 Master-1**（有 `/etc/kubernetes/admin.conf`）上执行。  
 脚本自动生成 token / `upload-certs`，SSH 到 conf 里尚未入群的节点并 join；**已在集群的跳过**，无需手抄命令。
@@ -386,7 +386,7 @@ sudo bash install-k8s-1.33.sh join 172.16.10.114:8443 \
 
 
 
-## 7. 后续扩容
+### 7. 后续扩容
 
 ### 加 Master
 
@@ -404,42 +404,16 @@ sudo bash install-k8s-1.33.sh join 172.16.10.114:8443 \
 ---
 
 
+### 8. 接入Kuboard，使用KubeConfig方式
+![](https://resource.starbucket.cn/website/image/posts/automated-script-deployment-k8s-1-33-vip-load-kuboard-visualization/447e29028f3643b28beff19d69af206e.png)
 
-## 8. 导入 Kuboard
+从/root/.kube/config 里面获取配置信息
+![](https://resource.starbucket.cn/website/image/posts/automated-script-deployment-k8s-1-33-vip-load-kuboard-visualization/095d69ff23ea4ce4bb65cb49e9e73a5f.png)
 
-`admin.conf` 里 `server:` 应为：
+成功接入
+![](https://resource.starbucket.cn/website/image/posts/automated-script-deployment-k8s-1-33-vip-load-kuboard-visualization/d7f89897c5624e25999a1fee0fe5d575.png)
 
-```text
-https://172.16.10.114:8443
+### 9. 下载地址
+````
+https://github.com/web-starbucket/k8s-script.git
 ```
-
-若仍是某台 Master 的 `6443`，请改成 `VIP:8443` 再导入。
-
-同目录可参考 `kuboard/docker-compose.yml` 在旁路机器起 Kuboard。
-
----
-
-
-
-## 9. 故障排查
-
-
-| 现象                 | 处理                                                           |
-| ------------------ | ------------------------------------------------------------ |
-| ping 不通 VIP        | 查 keepalived、网卡名、防火墙、`virtual_router_id` 是否一致                |
-| VIP 在，8443 不通      | `systemctl status haproxy`；`ss -lntp                         |
-| haproxy 起不来        | `journalctl -u haproxy`；是否未开 `ip_nonlocal_bind`              |
-| init 后 healthz 失败  | `curl -k https://127.0.0.1:6443/healthz`                     |
-| 节点长期 NotReady      | 是否执行了 `cni-calico`；看 `calico-system` / `tigera-operator` Pod |
-| join 连不上           | 确认用的是 **VIP:8443**，不是 6443                                   |
-| Calico yaml / 镜像失败 | 调整 `GH_PROXY`、`DOCKER_MIRROR`；必要时配置 Calico 国内镜像              |
-
-
-```bash
-sudo journalctl -u keepalived -u haproxy -n 50 --no-pager
-sudo cat /etc/haproxy/haproxy.cfg
-sudo cat /etc/keepalived/keepalived.conf
-kubectl get pods -A -o wide
-kubectl describe node <节点名>
-```
-
