@@ -1,0 +1,19 @@
+# Kuboard v3 - Docker Compose（固定配置）
+# 启动: docker compose up -d
+# 默认 admin / Kuboard123
+
+services:
+  kuboard:
+    image: registry.cn-chengdu.aliyuncs.com/obsbot/kuboard:v3
+    container_name: kuboard
+    restart: unless-stopped
+    privileged: true
+    ports:
+      - "18080:80"
+      - "10081:10081"
+    environment:
+      # 改成真实 IP/域名，禁止 127.0.0.1 / localhost
+      KUBOARD_ENDPOINT: "http://服务器IP:18080"
+      KUBOARD_AGENT_SERVER_TCP_PORT: "10081"
+    volumes:
+      - ./kuboard_data:/data
