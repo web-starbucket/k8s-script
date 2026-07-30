@@ -1,18 +1,6 @@
 #!/usr/bin/env bash
-# Ubuntu 24.04 一键准备 / 初始化 Kubernetes 1.33（kubeadm + containerd）
-# 默认全部走国内镜像（apt / pause / 控制面镜像 / CNI yaml 代理）
-# 用法见：K8s-1.33手动搭建指南.md
-#
-# 示例：
-#   sudo bash install-k8s-1.33.sh prepare
-#   sudo bash install-k8s-1.33.sh hosts
-#   sudo bash install-k8s-1.33.sh vip --vip=172.16.10.114 --iface=eth0 --priority=100 --peers=172.16.10.115,172.16.10.116 --lb-port=8443
-#   sudo bash install-k8s-1.33.sh init --apiserver-advertise-address=172.16.10.115 --control-plane-endpoint=172.16.10.114:8443
-#   sudo bash install-k8s-1.33.sh cni-calico
-#   sudo bash install-k8s-1.33.sh join-masters [--prepare]
-#   sudo bash install-k8s-1.33.sh join-workers [--prepare]
-#   sudo bash install-k8s-1.33.sh reset-all --yes
-#   sudo bash install-k8s-1.33.sh join-all
+# Ubuntu 24 + kubeadm/containerd Kubernetes 1.33（国内镜像）
+# 用法: bash install-k8s-1.33.sh --help  详见 K8s-1.33搭建指南.md
 
 set -euo pipefail
 
@@ -21,47 +9,26 @@ KUBE_VERSION="${KUBE_VERSION:-}"
 POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
 SERVICE_CIDR="${SERVICE_CIDR:-10.96.0.0/12}"
 
-# ---------- 国内镜像默认配置（可用环境变量覆盖）----------
-# Kubernetes apt 源（阿里云 kubernetes-new；注意是 /core/stable/ 斜杠路径，不是官方 core:/stable:/）
 K8S_APT_MIRROR="${K8S_APT_MIRROR:-https://mirrors.aliyun.com/kubernetes-new/core/stable/v${K8S_MINOR}/deb/}"
 K8S_APT_KEY_URL="${K8S_APT_KEY_URL:-https://mirrors.aliyun.com/kubernetes-new/core/stable/v${K8S_MINOR}/deb/Release.key}"
-# 备用：官方 pkgs.k8s.io（国外，仅密钥/源失败时回退）
 K8S_APT_MIRROR_FALLBACK="${K8S_APT_MIRROR_FALLBACK:-https://pkgs.k8s.io/core:/stable:/v${K8S_MINOR}/deb/}"
 K8S_APT_KEY_FALLBACK="${K8S_APT_KEY_FALLBACK:-https://pkgs.k8s.io/core:/stable:/v${K8S_MINOR}/deb/Release.key}"
-# kubeadm 控制面镜像仓库（对应 registry.k8s.io）
 IMAGE_REPOSITORY="${IMAGE_REPOSITORY:-registry.aliyuncs.com/google_containers}"
-# containerd sandbox / pause
 PAUSE_IMAGE="${PAUSE_IMAGE:-registry.aliyuncs.com/google_containers/pause:3.10}"
-# Docker Hub 加速（containerd hosts.toml）
 DOCKER_MIRROR="${DOCKER_MIRROR:-https://docker.m.daocloud.io}"
-# GitHub raw 代理（拉 CNI yaml；不可用可改 GH_PROXY="" 直连）
 GH_PROXY="${GH_PROXY:-https://ghfast.top/}"
-# Flannel 镜像（国内常用）
 FLANNEL_IMAGE_REPO="${FLANNEL_IMAGE_REPO:-docker.m.daocloud.io/flannel}"
-# Calico：阿里云公共仓无完整 calico/tigera 同步，默认用 DaoCloud 拉取（国内可用）
-# 若已同步到自有阿里云 ACR：export CALICO_REGISTRY=registry.cn-xxx.aliyuncs.com CALICO_IMAGE_PATH=命名空间
+
 CALICO_VERSION="${CALICO_VERSION:-v3.29.3}"
 CALICO_REGISTRY="${CALICO_REGISTRY:-docker.m.daocloud.io}"
 CALICO_IMAGE_PATH="${CALICO_IMAGE_PATH:-calico}"
 QUAY_MIRROR="${QUAY_MIRROR:-quay.m.daocloud.io}"
-# VIP / Keepalived + HAProxy
+
 VIP_IFACE="${VIP_IFACE:-}"
 VIP_ROUTER_ID="${VIP_ROUTER_ID:-51}"
 VIP_AUTH_PASS="${VIP_AUTH_PASS:-K8sVipPass33}"
-# HAProxy 对外端口（避免与 kube-apiserver 的 6443 冲突）
 LB_PORT="${LB_PORT:-8443}"
 
-# ---------- 集群节点表（可配置多台，含 SSH 账号）----------
-# 每行格式: IP|主机名|角色|用户名|密码
-# 角色: vip | master | worker（vip 行用户/密码可留空）
-# 密码勿含竖线 | ；含特殊字符一般可用，勿用单引号包一层进文件
-#
-# 【改法】编辑同目录 k8s-nodes.conf（推荐）后：
-#   sudo bash install-k8s-1.33.sh hosts
-#   sudo bash install-k8s-1.33.sh ssh-keys   # 按 conf 里账号密码自动互换密钥
-#
-# 安全：k8s-nodes.conf 含密码，权限建议 chmod 600，勿提交 git
-#
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 K8S_NODES_FILE="${K8S_NODES_FILE:-${SCRIPT_DIR}/k8s-nodes.conf}"
 
@@ -75,7 +42,7 @@ EOF
 )"
 
 if [[ -z "${K8S_NODES:-}" && -f "${K8S_NODES_FILE}" ]]; then
-  # 必须加 ^：否则 (#|$) 中的 $ 会匹配「每一行行尾」，把全部有效行滤掉，误用内置默认表
+  # 过滤注释行须加 ^，否则 $ 会匹配每行行尾导致读空表
   K8S_NODES="$(grep -vE '^[[:space:]]*(#|$)' "${K8S_NODES_FILE}" || true)"
 elif [[ -n "${K8S_NODES:-}" ]]; then
   K8S_NODES_FROM_ENV=1
@@ -85,7 +52,6 @@ K8S_NODES="${K8S_NODES:-${_DEFAULT_K8S_NODES}}"
 SET_HOSTNAME="${SET_HOSTNAME:-1}"
 SSH_PEERS="${SSH_PEERS:-}"
 
-# 输出规范化节点行（保留密码中的字符，只去首尾空白与 CR）
 list_nodes() {
   echo "${K8S_NODES}" | sed 's/\r$//' | grep -vE '^[[:space:]]*(#|$)' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
 }
@@ -107,7 +73,6 @@ default_master_peers() {
   ips_by_role_csv master
 }
 
-# SSH 目标：master + worker（跳过 vip）
 list_ssh_nodes() {
   list_nodes | awk -F'|' '
     BEGIN { OFS="|" }
@@ -171,7 +136,6 @@ check_os() {
 gh_url() {
   local url="$1"
   if [[ -n "${GH_PROXY}" ]]; then
-    # 已带代理前缀则不再加
     if [[ "${url}" == "${GH_PROXY}"* ]]; then
       echo "${url}"
     else
@@ -195,7 +159,6 @@ server = "https://docker.io"
   capabilities = ["pull", "resolve"]
 EOF
 
-  # quay.io（Calico / tigera-operator）
   mkdir -p /etc/containerd/certs.d/quay.io
   cat >/etc/containerd/certs.d/quay.io/hosts.toml <<EOF
 server = "https://quay.io"
@@ -204,7 +167,6 @@ server = "https://quay.io"
   capabilities = ["pull", "resolve"]
 EOF
 
-  # registry.k8s.io -> 阿里云（部分组件仍可能直连该域名）
   mkdir -p /etc/containerd/certs.d/registry.k8s.io
   cat >/etc/containerd/certs.d/registry.k8s.io/hosts.toml <<'EOF'
 server = "https://registry.k8s.io"
@@ -214,7 +176,6 @@ server = "https://registry.k8s.io"
   override_path = true
 EOF
 
-  # gcr.io 常见依赖
   mkdir -p /etc/containerd/certs.d/gcr.io
   cat >/etc/containerd/certs.d/gcr.io/hosts.toml <<'EOF'
 server = "https://gcr.io"
@@ -224,11 +185,9 @@ server = "https://gcr.io"
   override_path = true
 EOF
 
-  # 确保 config.toml 使用 config_path
   if grep -q 'config_path' /etc/containerd/config.toml 2>/dev/null; then
     sed -i 's|config_path = ".*"|config_path = "/etc/containerd/certs.d"|' /etc/containerd/config.toml
   else
-    # 追加到 cri registry 段（兼容 default 配置）
     if ! grep -q '/etc/containerd/certs.d' /etc/containerd/config.toml; then
       cat >>/etc/containerd/config.toml <<'EOF'
 
@@ -259,7 +218,6 @@ print_mirror_summary() {
   echo
 }
 
-# 写入 /etc/hosts 托管段（可重复执行，幂等替换）
 configure_hosts() {
   local marker_begin="# BEGIN K8S-1.33-CLUSTER"
   local marker_end="# END K8S-1.33-CLUSTER"
@@ -341,7 +299,6 @@ cmd_hosts() {
   maybe_set_hostname
 }
 
-# 管理机一键：按 conf 远程刷新全部 master/worker 的 /etc/hosts（及主机名）
 cmd_hosts_all() {
   need_root hosts-all
   local dry=0 only_ip=""
@@ -410,7 +367,6 @@ cmd_hosts_all() {
   log "hosts-all 结束：成功=${n_ok} 跳过=${n_skip} 失败=${n_fail}"
 }
 
-# 从 k8s-nodes.conf 读取 master/worker 的 IP/用户/密码，自动互换 SSH 密钥
 cmd_ssh_keys() {
   need_root ssh-keys
   local mutual=1
@@ -466,7 +422,6 @@ EOF
   errf="$(mktemp)"
   while IFS='|' read -r ip host role user pass || [[ -n "${ip:-}" ]]; do
     [[ -n "${ip}" ]] || continue
-    # 去掉密码首尾空白 / Windows 残留 CR
     pass="$(printf '%s' "${pass}" | sed 's/\r$//;s/^[[:space:]]*//;s/[[:space:]]*$//')"
     if is_local_ip "${ip}"; then
       log "跳过本机 ${user}@${ip} (${host})"
@@ -482,7 +437,7 @@ EOF
     fi
     log "ssh-copy-id ${user}@${ip} (${host})"
     : >"${errf}"
-    # ssh-copy-id/ssh 默认读 stdin，必须 </dev/null，否则 while-read 只处理第一台
+    # ssh 会吞 stdin，while-read 循环内必须 </dev/null
     if SSHPASS="${pass}" sshpass -e ssh-copy-id -i /root/.ssh/id_rsa.pub \
       -o StrictHostKeyChecking=no \
       -o PreferredAuthentications=password \
@@ -497,7 +452,6 @@ EOF
       echo "       请在本机手工验证: sshpass -e ssh -o PreferredAuthentications=password root@${ip}"
       echo "       并设置 SSHPASS='你的密码'；远端需 PermitRootLogin yes 且 PasswordAuthentication yes"
     fi
-    # 远程若无密钥则生成，便于后续互通
     SSHPASS="${pass}" sshpass -e ssh -n -o StrictHostKeyChecking=no \
       -o PreferredAuthentications=password -o PubkeyAuthentication=no \
       "${user}@${ip}" \
@@ -628,7 +582,6 @@ EOF
   containerd config default >/etc/containerd/config.toml
   sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
   sed -i "s|sandbox_image = \".*\"|sandbox_image = \"${PAUSE_IMAGE}\"|" /etc/containerd/config.toml
-  # 关闭 default 里可能存在的旧 mirrors 段冲突时仍以 config_path 为准
   configure_containerd_mirrors
   systemctl daemon-reload
   systemctl enable --now containerd
@@ -638,7 +591,7 @@ EOF
   mkdir -p -m 755 /etc/apt/keyrings
   local apt_mirror="${K8S_APT_MIRROR}"
   local key_url="${K8S_APT_KEY_URL}"
-  # 非交互环境（SSH 远程 prepare）下 gpg 不能打开 /dev/tty，必须 --batch，且先删旧 keyring
+  # 远程非交互：gpg 须 --batch（否则打不开 /dev/tty）
   install_k8s_apt_key() {
     local url="$1"
     local out="/etc/apt/keyrings/kubernetes-apt-keyring.gpg"
@@ -650,7 +603,6 @@ EOF
       return 1
     fi
     if ! gpg --batch --yes --dearmor -o "${out}" "${tmp}" 2>/dev/null; then
-      # 部分环境 pipe 更稳
       if ! gpg --batch --yes --dearmor <"${tmp}" >"${out}"; then
         rm -f "${tmp}"
         return 1
@@ -766,8 +718,6 @@ cmd_init() {
   echo "  详见 K8s-1.33搭建指南.md"
 }
 
-# 两台 Master 上安装 HAProxy（负载到各节点 :6443）+ Keepalived（VIP 漂移）
-# 对外入口: VIP:LB_PORT（默认 8443），避免与本机 kube-apiserver :6443 抢端口
 cmd_vip() {
   need_root vip
   local vip="" iface="${VIP_IFACE}" priority="100" peers="" lb_port="${LB_PORT}"
@@ -781,7 +731,6 @@ cmd_vip() {
       *) err "未知参数: $1（[--vip=] [--iface=] [--priority=] [--peers=] [--lb-port=8443]；省略则读节点表）" ;;
     esac
   done
-  # 未传参时从节点表自动填充
   [[ -n "${vip}" ]] || vip="$(default_vip_ip)"
   [[ -n "${peers}" ]] || peers="$(default_master_peers)"
   [[ -n "${vip}" ]] || err "未指定 --vip= 且节点表中无 vip 角色"
@@ -813,7 +762,6 @@ EOF
   done
 
   log "3/4 写入 HAProxy（前端 ${vip}:${lb_port} → 后端 Masters:6443）"
-  # init 前后端 6443 未起来会告警 “no server available”，属正常，不影响 haproxy 进程
   cat >/etc/haproxy/haproxy.cfg <<EOF
 global
     log /dev/log local0
@@ -849,7 +797,6 @@ backend k8s-api-back
 ${backend_cfg}
 EOF
 
-  # 健康检查：只看 haproxy 进程（不看后端 6443，否则 init 前 VIP 抢不起来）
   mkdir -p /etc/keepalived
   cat >/etc/keepalived/check_haproxy.sh <<'EOF'
 #!/bin/bash
@@ -864,8 +811,6 @@ EOF
   fi
 
   log "4/4 写入 Keepalived（VIP=${vip}, priority=${priority}, iface=${iface}）"
-  # 去掉 enable_script_security，避免 Ubuntu 上脚本权限导致 keepalived 起不来
-  # 实验阶段不 track_script，保证 VIP 先漂起来；集群就绪后可自行打开 track
   cat >/etc/keepalived/keepalived.conf <<EOF
 global_defs {
     router_id K8S_VIP_${VIP_ROUTER_ID}
@@ -919,14 +864,13 @@ EOF
   warn "单机 vip 完成。多 Master 请用: sudo bash $0 vip-all   （管理机一键部署全部 Master）"
 }
 
-# 管理机一键：按 conf 给所有 master 安装 HAProxy+Keepalived（自动分配 priority）
 remote_ssh() {
   local user="$1" ip="$2" pass="$3" cmd="$4"
   if is_local_ip "${ip}"; then
     bash -c "${cmd}"
     return $?
   fi
-  # 必须 </dev/null：在 while-read 循环中 SSH 默认会吞掉 stdin，导致只处理第一台节点
+  # while-read 中 SSH 须 -n / </dev/null，否则只处理第一台
   if ssh -n -o BatchMode=yes -o ConnectTimeout=8 "${user}@${ip}" "true" 2>/dev/null; then
     ssh -n -o BatchMode=yes -o ConnectTimeout=30 "${user}@${ip}" "${cmd}"
     return $?
@@ -1053,13 +997,11 @@ ensure_cluster_admin() {
   kubectl get nodes >/dev/null 2>&1 || err "无法访问集群 API，请确认本机 admin.conf 与 VIP/apiserver 可用"
 }
 
-# 判断节点是否已在集群（按主机名或 INTERNAL-IP）
 node_in_cluster() {
   local ip="$1" host="$2"
   kubectl get nodes -o wide --no-headers 2>/dev/null | awk -v ip="${ip}" -v h="${host}" '
     {
       name=$1
-      # NAME STATUS ROLES AGE VERSION INTERNAL-IP EXTERNAL-IP OS-IMAGE KERNEL CONTAINER-RUNTIME
       internal=$6
       if (name == h || internal == ip) { found=1; exit }
     }
@@ -1067,7 +1009,6 @@ node_in_cluster() {
   '
 }
 
-# 生成 worker join 参数（不含 kubeadm / cri-socket）：ENDPOINT --token ... --discovery-token-ca-cert-hash ...
 build_join_worker_args() {
   local line token hash endpoint
   endpoint="$(default_vip_ip):${LB_PORT}"
@@ -1079,7 +1020,6 @@ build_join_worker_args() {
   echo "${endpoint} --token ${token} --discovery-token-ca-cert-hash ${hash}"
 }
 
-# 上传控制面证书并返回 certificate-key
 upload_certificate_key() {
   local out key
   out="$(kubeadm init phase upload-certs --upload-certs 2>&1)" || err "upload-certs 失败: ${out}"
@@ -1101,7 +1041,6 @@ sync_install_to_node() {
   remote_ssh "${user}" "${ip}" "${pass}" "chmod +x ${remote_dir}/install-k8s-1.33.sh" || return 1
 }
 
-# 管理机一键：按 conf 把尚未入群的 worker 远程 join（自动建 token，无需手抄命令）
 cmd_join_workers() {
   need_root join-workers
   local dry=0 do_prepare=0 do_reset=0 only_ip=""
@@ -1172,7 +1111,6 @@ cmd_join_workers() {
       continue
     }
 
-    # 未入群但有残留时自动 reset（或显式 --reset）
     if [[ "${do_reset}" == "1" ]] \
       || remote_ssh "${user}" "${ip}" "${pass}" "test -f /etc/kubernetes/kubelet.conf" 2>/dev/null; then
       log "远程 reset（清理 kubelet.conf / 10250 残留）..."
@@ -1203,7 +1141,6 @@ cmd_join_workers() {
   kubectl get nodes -o wide || true
 }
 
-# 管理机一键：按 conf 把尚未入群的 master 以 control-plane 远程 join
 cmd_join_masters() {
   need_root join-masters
   local dry=0 do_prepare=0 do_vip=1 only_ip="" iface_arg=""
@@ -1311,7 +1248,6 @@ cmd_join_masters() {
   kubectl get nodes -o wide || true
 }
 
-# 一键：先补 Master，再补 Worker
 cmd_join_all() {
   need_root join-all
   local rest=()
@@ -1333,7 +1269,6 @@ cmd_join_all() {
   log "==== 1/2 join-masters ===="
   cmd_join_masters "${rest[@]}"
   log "==== 2/2 join-workers ===="
-  # workers 不需要 vip / cert；过滤掉 master 专用参数
   local wargs=()
   local a
   for a in "${rest[@]}"; do
@@ -1354,7 +1289,6 @@ cmd_cni_flannel() {
   tmp="$(mktemp)"
   log "安装 Flannel（yaml: ${url}）"
   curl -fsSL "${url}" -o "${tmp}" || err "下载 Flannel yaml 失败，可设置 GH_PROXY 或手动下载后 kubectl apply"
-  # 替换镜像为国内可访问地址
   sed -i \
     -e "s|docker.io/flannel/|${FLANNEL_IMAGE_REPO}/|g" \
     -e "s|ghcr.io/flannel-io/|${FLANNEL_IMAGE_REPO}/|g" \
@@ -1384,8 +1318,7 @@ cmd_cni_calico() {
     -e "s|docker.io/|${CALICO_REGISTRY}/|g" \
     "${op_tmp}"
 
-  # 大 CRD 不能用客户端 apply（last-applied-configuration 注解会超 256KB）
-  # 必须用 server-side apply
+  # 大 CRD 须 server-side apply（客户端 apply 注解会超 256KB）
   if ! kubectl apply --server-side --force-conflicts -f "${op_tmp}"; then
     warn "server-side apply 失败，尝试 replace CRDs + apply 其余资源"
     kubectl replace --force -f "${op_tmp}" 2>/dev/null \
@@ -1396,7 +1329,6 @@ cmd_cni_calico() {
   curl -fsSL "$(gh_url "${cr_raw}")" -o "${cr_tmp}" || err "下载 custom-resources.yaml 失败"
   sed -i "s|cidr: 192\.168\.0\.0/16|cidr: ${POD_CIDR}|" "${cr_tmp}"
 
-  # 写入/替换 registry、imagePath
   if grep -qE '^[[:space:]]*registry:' "${cr_tmp}"; then
     sed -i -E "s|^([[:space:]]*registry:).*|\1 ${CALICO_REGISTRY}|" "${cr_tmp}"
   else
@@ -1452,7 +1384,6 @@ cmd_cni_calico() {
   warn "若要用自有阿里云 ACR：先同步镜像，再 export CALICO_REGISTRY=你的ACR QUAY_MIRROR=你的ACR"
 }
 
-# 已安装但镜像仍是国外源时：只改 Installation.registry 并重启相关 Pod
 cmd_cni_calico_mirror() {
   need_root cni-calico-mirror
   export KUBECONFIG=/etc/kubernetes/admin.conf
@@ -1508,7 +1439,6 @@ cmd_reset() {
   do_node_cleanup "${clean_vip}"
 }
 
-# 本机彻底清理 Kubernetes（及可选 VIP 栈）
 do_node_cleanup() {
   local clean_vip="${1:-0}"
   log "执行 kubeadm reset ..."
@@ -1544,7 +1474,6 @@ do_node_cleanup() {
     rm -f /etc/keepalived/keepalived.conf /etc/haproxy/haproxy.cfg \
       /etc/sysctl.d/99-vip-nonlocal.conf /etc/keepalived/check_haproxy.sh \
       2>/dev/null || true
-    # 若本机仍挂着 VIP，尝试摘掉（忽略失败）
     local vip
     vip="$(default_vip_ip 2>/dev/null || true)"
     if [[ -n "${vip}" ]]; then
@@ -1557,7 +1486,6 @@ do_node_cleanup() {
   log "本机已清理完成。需要重建时再执行: sudo bash $0 prepare"
 }
 
-# 管理机一键：按 conf 清理全部 master + worker（删除集群）
 cmd_reset_all() {
   need_root reset-all
   local dry=0 skip_wait=0 only_ip="" clean_vip=1
@@ -1625,7 +1553,6 @@ cmd_reset_all() {
     fi
 
     sync_install_to_node "${user}" "${ip}" "${pass}" "${remote_dir}" || {
-      # 无脚本时仍尝试直接 kubeadm reset
       warn "同步脚本失败，尝试远程直接 kubeadm reset"
       if remote_ssh "${user}" "${ip}" "${pass}" "kubeadm reset -f; rm -rf /etc/kubernetes /etc/cni/net.d /var/lib/cni /var/lib/kubelet/* /var/lib/etcd /root/.kube; systemctl restart containerd || true"; then
         log "OK ${host}（简易清理）"
