@@ -11,6 +11,7 @@
 #   sudo bash install-k8s-1.33.sh cni-calico
 #   sudo bash install-k8s-1.33.sh join-masters [--prepare]
 #   sudo bash install-k8s-1.33.sh join-workers [--prepare]
+#   sudo bash install-k8s-1.33.sh reset-all --yes
 #   sudo bash install-k8s-1.33.sh join-all
 
 set -euo pipefail
@@ -37,6 +38,12 @@ DOCKER_MIRROR="${DOCKER_MIRROR:-https://docker.m.daocloud.io}"
 GH_PROXY="${GH_PROXY:-https://ghfast.top/}"
 # Flannel 镜像（国内常用）
 FLANNEL_IMAGE_REPO="${FLANNEL_IMAGE_REPO:-docker.m.daocloud.io/flannel}"
+# Calico：阿里云公共仓无完整 calico/tigera 同步，默认用 DaoCloud 拉取（国内可用）
+# 若已同步到自有阿里云 ACR：export CALICO_REGISTRY=registry.cn-xxx.aliyuncs.com CALICO_IMAGE_PATH=命名空间
+CALICO_VERSION="${CALICO_VERSION:-v3.29.3}"
+CALICO_REGISTRY="${CALICO_REGISTRY:-docker.m.daocloud.io}"
+CALICO_IMAGE_PATH="${CALICO_IMAGE_PATH:-calico}"
+QUAY_MIRROR="${QUAY_MIRROR:-quay.m.daocloud.io}"
 # VIP / Keepalived + HAProxy
 VIP_IFACE="${VIP_IFACE:-}"
 VIP_ROUTER_ID="${VIP_ROUTER_ID:-51}"
@@ -59,15 +66,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 K8S_NODES_FILE="${K8S_NODES_FILE:-${SCRIPT_DIR}/k8s-nodes.conf}"
 
 _DEFAULT_K8S_NODES="$(cat <<'EOF'
-172.16.10.114|k8s-vip|vip||
-172.16.10.115|k8s-m1|master|root|ChangeMe
-172.16.10.116|k8s-m2|master|root|ChangeMe
+172.16.10.100|k8s-vip|vip||
+172.16.10.114|k8s-m1|master|root|ChangeMe
+172.16.10.115|k8s-m2|master|root|ChangeMe
+172.16.10.116|k8s-m3|master|root|ChangeMe
 172.16.10.117|k8s-n1|worker|root|ChangeMe
 EOF
 )"
 
 if [[ -z "${K8S_NODES:-}" && -f "${K8S_NODES_FILE}" ]]; then
-  K8S_NODES="$(grep -vE '[[:space:]]*(#|$)' "${K8S_NODES_FILE}" || true)"
+  # 必须加 ^：否则 (#|$) 中的 $ 会匹配「每一行行尾」，把全部有效行滤掉，误用内置默认表
+  K8S_NODES="$(grep -vE '^[[:space:]]*(#|$)' "${K8S_NODES_FILE}" || true)"
+elif [[ -n "${K8S_NODES:-}" ]]; then
+  K8S_NODES_FROM_ENV=1
 fi
 K8S_NODES="${K8S_NODES:-${_DEFAULT_K8S_NODES}}"
 
@@ -184,6 +195,15 @@ server = "https://docker.io"
   capabilities = ["pull", "resolve"]
 EOF
 
+  # quay.io（Calico / tigera-operator）
+  mkdir -p /etc/containerd/certs.d/quay.io
+  cat >/etc/containerd/certs.d/quay.io/hosts.toml <<EOF
+server = "https://quay.io"
+
+[host."https://${QUAY_MIRROR}"]
+  capabilities = ["pull", "resolve"]
+EOF
+
   # registry.k8s.io -> 阿里云（部分组件仍可能直连该域名）
   mkdir -p /etc/containerd/certs.d/registry.k8s.io
   cat >/etc/containerd/certs.d/registry.k8s.io/hosts.toml <<'EOF'
@@ -294,7 +314,19 @@ cmd_nodes() {
     printf "%-16s %-14s %-8s %s\n" "${ip}" "${host}" "${role}" "${user:-}"
   done
   echo
-  echo "配置文件: ${K8S_NODES_FILE} $([ -f "${K8S_NODES_FILE}" ] && echo '(已加载)' || echo '(不存在则用内置默认)')"
+  if [[ -n "${K8S_NODES_FROM_ENV:-}" ]]; then
+    echo "数据来源: 环境变量 K8S_NODES"
+  elif [[ -f "${K8S_NODES_FILE}" ]]; then
+    local nfile nmem
+    nfile="$(grep -cvE '^[[:space:]]*(#|$)' "${K8S_NODES_FILE}" 2>/dev/null || echo 0)"
+    nmem="$(list_nodes | grep -c . || true)"
+    echo "配置文件: ${K8S_NODES_FILE}（已加载，文件有效行=${nfile}，当前使用=${nmem}）"
+    if [[ "${nfile}" != "${nmem}" ]]; then
+      warn "文件行数与内存不一致，请检查 conf 或是否设置了 K8S_NODES"
+    fi
+  else
+    echo "配置文件: ${K8S_NODES_FILE}（不存在，使用脚本内置默认表）"
+  fi
   echo "VIP: $(default_vip_ip)"
   echo "Master peers: $(default_master_peers)"
   echo "SSH 目标:"
@@ -307,6 +339,75 @@ cmd_hosts() {
   need_root hosts
   configure_hosts
   maybe_set_hostname
+}
+
+# 管理机一键：按 conf 远程刷新全部 master/worker 的 /etc/hosts（及主机名）
+cmd_hosts_all() {
+  need_root hosts-all
+  local dry=0 only_ip=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry=1; shift ;;
+      --only=*)  only_ip="${1#*=}"; shift ;;
+      *) err "用法: $0 hosts-all [--only=IP] [--dry-run]" ;;
+    esac
+  done
+
+  [[ -f "${K8S_NODES_FILE}" ]] || err "需要 ${K8S_NODES_FILE}"
+  [[ -f "${SCRIPT_DIR}/install-k8s-1.33.sh" ]] || err "找不到安装脚本"
+  ensure_sshpass
+
+  log "一键刷新 hosts，配置: ${K8S_NODES_FILE}"
+  echo "  VIP=$(default_vip_ip)  masters=$(default_master_peers)"
+  echo
+
+  local ip host role user pass remote_dir n_ok=0 n_fail=0 n_skip=0
+  remote_dir="/opt/service/k8s"
+  while IFS='|' read -r ip host role user pass; do
+    [[ -n "${ip}" ]] || continue
+    [[ -n "${only_ip}" && "${ip}" != "${only_ip}" ]] && continue
+
+    log "======== ${user}@${ip} (${host}) [${role}] ========"
+    if [[ "${dry}" == "1" ]]; then
+      echo "  DRY-RUN: hosts"
+      continue
+    fi
+
+    if is_local_ip "${ip}"; then
+      if bash "${SCRIPT_DIR}/install-k8s-1.33.sh" hosts; then
+        log "OK 本机 hosts 已刷新"
+        n_ok=$((n_ok + 1))
+      else
+        warn "FAIL 本机"
+        n_fail=$((n_fail + 1))
+      fi
+      continue
+    fi
+
+    if [[ -z "${pass}" ]] && ! ssh -n -o BatchMode=yes -o ConnectTimeout=5 "${user}@${ip}" "true" 2>/dev/null; then
+      warn "跳过 ${ip}：无密码且无法免密 SSH（请先 ssh-keys）"
+      n_skip=$((n_skip + 1))
+      continue
+    fi
+
+    sync_install_to_node "${user}" "${ip}" "${pass}" "${remote_dir}" || {
+      warn "同步脚本/conf 失败 ${ip}"
+      n_fail=$((n_fail + 1))
+      continue
+    }
+
+    if remote_ssh "${user}" "${ip}" "${pass}" "cd ${remote_dir} && bash install-k8s-1.33.sh hosts"; then
+      log "OK ${host} (${ip})"
+      n_ok=$((n_ok + 1))
+    else
+      warn "FAIL ${host} (${ip})"
+      n_fail=$((n_fail + 1))
+    fi
+    echo
+  done < <(list_ssh_nodes)
+
+  echo
+  log "hosts-all 结束：成功=${n_ok} 跳过=${n_skip} 失败=${n_fail}"
 }
 
 # 从 k8s-nodes.conf 读取 master/worker 的 IP/用户/密码，自动互换 SSH 密钥
@@ -360,10 +461,13 @@ EOF
     chmod 600 /root/.ssh/config
   fi
 
-  log "按 conf 向各节点分发本机公钥（sshpass，非交互）"
-  local ip host role user pass
-  while IFS='|' read -r ip host role user pass; do
+  log "按 conf 向各节点分发本机公钥（sshpass，非交互）；共 ${count} 台 master/worker"
+  local ip host role user pass errf
+  errf="$(mktemp)"
+  while IFS='|' read -r ip host role user pass || [[ -n "${ip:-}" ]]; do
     [[ -n "${ip}" ]] || continue
+    # 去掉密码首尾空白 / Windows 残留 CR
+    pass="$(printf '%s' "${pass}" | sed 's/\r$//;s/^[[:space:]]*//;s/[[:space:]]*$//')"
     if is_local_ip "${ip}"; then
       log "跳过本机 ${user}@${ip} (${host})"
       continue
@@ -372,18 +476,35 @@ EOF
       warn "${ip} (${host}) 未配置密码，跳过自动分发；请补全 conf 或手动 ssh-copy-id"
       continue
     fi
+    if [[ "${pass}" == "ChangeMe" || "${pass}" == "请改成真实密码" ]]; then
+      warn "${ip} (${host}) 密码仍是占位符「${pass}」，请改成真实 root 密码后再跑 ssh-keys"
+      continue
+    fi
     log "ssh-copy-id ${user}@${ip} (${host})"
+    : >"${errf}"
+    # ssh-copy-id/ssh 默认读 stdin，必须 </dev/null，否则 while-read 只处理第一台
     if SSHPASS="${pass}" sshpass -e ssh-copy-id -i /root/.ssh/id_rsa.pub \
-      -o StrictHostKeyChecking=no "${user}@${ip}" >/dev/null 2>&1; then
+      -o StrictHostKeyChecking=no \
+      -o PreferredAuthentications=password \
+      -o PubkeyAuthentication=no \
+      "${user}@${ip}" </dev/null >/dev/null 2>"${errf}"; then
       log "  OK 已写入 ${ip}"
     else
-      warn "  FAIL ${user}@${ip}（检查 conf 密码、sshd PermitRootLogin、网络）"
+      warn "  FAIL ${user}@${ip}"
+      if [[ -s "${errf}" ]]; then
+        echo "       详情: $(tr '\n' ' ' <"${errf}" | sed 's/[[:space:]]\+/ /g' | cut -c1-200)"
+      fi
+      echo "       请在本机手工验证: sshpass -e ssh -o PreferredAuthentications=password root@${ip}"
+      echo "       并设置 SSHPASS='你的密码'；远端需 PermitRootLogin yes 且 PasswordAuthentication yes"
     fi
     # 远程若无密钥则生成，便于后续互通
-    SSHPASS="${pass}" sshpass -e ssh -o StrictHostKeyChecking=no "${user}@${ip}" \
+    SSHPASS="${pass}" sshpass -e ssh -n -o StrictHostKeyChecking=no \
+      -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+      "${user}@${ip}" \
       'mkdir -p /root/.ssh; chmod 700 /root/.ssh; test -f /root/.ssh/id_rsa || ssh-keygen -t rsa -b 4096 -N "" -f /root/.ssh/id_rsa' \
-      >/dev/null 2>&1 || true
+      </dev/null >/dev/null 2>&1 || true
   done < <(list_ssh_nodes)
+  rm -f "${errf}"
 
   if [[ "${mutual}" == "1" ]]; then
     log "收集各节点公钥并写回所有节点（互通免密）"
@@ -398,10 +519,10 @@ EOF
     while IFS='|' read -r ip host role user pass; do
       [[ -n "${ip}" ]] || continue
       is_local_ip "${ip}" && continue
-      if ssh -o BatchMode=yes -o ConnectTimeout=5 "${user}@${ip}" "cat /root/.ssh/id_rsa.pub" >>"${tmp_bundle}" 2>/dev/null; then
+      if ssh -n -o BatchMode=yes -o ConnectTimeout=5 "${user}@${ip}" "cat /root/.ssh/id_rsa.pub" >>"${tmp_bundle}" 2>/dev/null; then
         :
       elif [[ -n "${pass}" ]]; then
-        SSHPASS="${pass}" sshpass -e ssh -o StrictHostKeyChecking=no "${user}@${ip}" \
+        SSHPASS="${pass}" sshpass -e ssh -n -o StrictHostKeyChecking=no "${user}@${ip}" \
           "cat /root/.ssh/id_rsa.pub" >>"${tmp_bundle}" 2>/dev/null || warn "无法获取 ${ip} 公钥"
       fi
     done < <(list_ssh_nodes)
@@ -428,23 +549,23 @@ rm -f /tmp/k8s_authorized_bundle
 EOS
     chmod +x "${merge_sh}"
 
-    while IFS='|' read -r ip host role user pass; do
+    while IFS='|' read -r ip host role user pass || [[ -n "${ip:-}" ]]; do
       [[ -n "${ip}" ]] || continue
       is_local_ip "${ip}" && continue
       if scp -o BatchMode=yes -o ConnectTimeout=5 \
-          "${tmp_bundle}" "${user}@${ip}:/tmp/k8s_authorized_bundle" 2>/dev/null \
-        && scp -o BatchMode=yes "${merge_sh}" "${user}@${ip}:/tmp/k8s_merge_keys.sh" 2>/dev/null \
-        && ssh -o BatchMode=yes "${user}@${ip}" "bash /tmp/k8s_merge_keys.sh; rm -f /tmp/k8s_merge_keys.sh" 2>/dev/null; then
+          "${tmp_bundle}" "${user}@${ip}:/tmp/k8s_authorized_bundle" </dev/null 2>/dev/null \
+        && scp -o BatchMode=yes "${merge_sh}" "${user}@${ip}:/tmp/k8s_merge_keys.sh" </dev/null 2>/dev/null \
+        && ssh -n -o BatchMode=yes "${user}@${ip}" "bash /tmp/k8s_merge_keys.sh; rm -f /tmp/k8s_merge_keys.sh" </dev/null 2>/dev/null; then
         log "已合并密钥到 ${user}@${ip}"
         continue
       fi
       if [[ -n "${pass}" ]]; then
         if SSHPASS="${pass}" sshpass -e scp -o StrictHostKeyChecking=no \
-            "${tmp_bundle}" "${user}@${ip}:/tmp/k8s_authorized_bundle" \
+            "${tmp_bundle}" "${user}@${ip}:/tmp/k8s_authorized_bundle" </dev/null \
           && SSHPASS="${pass}" sshpass -e scp -o StrictHostKeyChecking=no \
-            "${merge_sh}" "${user}@${ip}:/tmp/k8s_merge_keys.sh" \
-          && SSHPASS="${pass}" sshpass -e ssh -o StrictHostKeyChecking=no "${user}@${ip}" \
-            "bash /tmp/k8s_merge_keys.sh; rm -f /tmp/k8s_merge_keys.sh"; then
+            "${merge_sh}" "${user}@${ip}:/tmp/k8s_merge_keys.sh" </dev/null \
+          && SSHPASS="${pass}" sshpass -e ssh -n -o StrictHostKeyChecking=no "${user}@${ip}" \
+            "bash /tmp/k8s_merge_keys.sh; rm -f /tmp/k8s_merge_keys.sh" </dev/null; then
           log "已合并密钥到 ${user}@${ip}"
         else
           warn "合并密钥到 ${ip} 失败"
@@ -461,7 +582,7 @@ EOS
   while IFS='|' read -r ip host role user pass; do
     [[ -n "${ip}" ]] || continue
     is_local_ip "${ip}" && continue
-    if ssh -o BatchMode=yes -o ConnectTimeout=5 "${user}@${ip}" "hostname" 2>/dev/null; then
+    if ssh -n -o BatchMode=yes -o ConnectTimeout=5 "${user}@${ip}" "hostname" 2>/dev/null; then
       echo "  OK  ${user}@${ip} (${host})"
     else
       echo "  FAIL ${user}@${ip} (${host})"
@@ -517,11 +638,33 @@ EOF
   mkdir -p -m 755 /etc/apt/keyrings
   local apt_mirror="${K8S_APT_MIRROR}"
   local key_url="${K8S_APT_KEY_URL}"
-  if ! curl -fsSL "${key_url}" | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg; then
+  # 非交互环境（SSH 远程 prepare）下 gpg 不能打开 /dev/tty，必须 --batch，且先删旧 keyring
+  install_k8s_apt_key() {
+    local url="$1"
+    local out="/etc/apt/keyrings/kubernetes-apt-keyring.gpg"
+    local tmp
+    tmp="$(mktemp)"
+    rm -f "${out}"
+    if ! curl -fsSL "${url}" -o "${tmp}"; then
+      rm -f "${tmp}"
+      return 1
+    fi
+    if ! gpg --batch --yes --dearmor -o "${out}" "${tmp}" 2>/dev/null; then
+      # 部分环境 pipe 更稳
+      if ! gpg --batch --yes --dearmor <"${tmp}" >"${out}"; then
+        rm -f "${tmp}"
+        return 1
+      fi
+    fi
+    rm -f "${tmp}"
+    chmod 0644 "${out}"
+    return 0
+  }
+  if ! install_k8s_apt_key "${key_url}"; then
     warn "阿里云密钥失败，回退官方 pkgs.k8s.io"
     apt_mirror="${K8S_APT_MIRROR_FALLBACK}"
     key_url="${K8S_APT_KEY_FALLBACK}"
-    curl -fsSL "${key_url}" | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    install_k8s_apt_key "${key_url}" || err "写入 Kubernetes apt 密钥失败"
   fi
   echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] ${apt_mirror} /" \
     >/etc/apt/sources.list.d/kubernetes.list
@@ -530,7 +673,7 @@ EOF
   if ! apt-get update -y; then
     warn "当前 apt 源更新失败，切换到官方源重试"
     apt_mirror="${K8S_APT_MIRROR_FALLBACK}"
-    curl -fsSL "${K8S_APT_KEY_FALLBACK}" | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    install_k8s_apt_key "${K8S_APT_KEY_FALLBACK}" || err "官方密钥也失败"
     echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] ${apt_mirror} /" \
       >/etc/apt/sources.list.d/kubernetes.list
     apt-get update -y
@@ -783,12 +926,13 @@ remote_ssh() {
     bash -c "${cmd}"
     return $?
   fi
-  if ssh -o BatchMode=yes -o ConnectTimeout=8 "${user}@${ip}" "true" 2>/dev/null; then
-    ssh -o BatchMode=yes -o ConnectTimeout=30 "${user}@${ip}" "${cmd}"
+  # 必须 </dev/null：在 while-read 循环中 SSH 默认会吞掉 stdin，导致只处理第一台节点
+  if ssh -n -o BatchMode=yes -o ConnectTimeout=8 "${user}@${ip}" "true" 2>/dev/null; then
+    ssh -n -o BatchMode=yes -o ConnectTimeout=30 "${user}@${ip}" "${cmd}"
     return $?
   fi
   [[ -n "${pass}" ]] || return 1
-  SSHPASS="${pass}" sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 "${user}@${ip}" "${cmd}"
+  SSHPASS="${pass}" sshpass -e ssh -n -o StrictHostKeyChecking=no -o ConnectTimeout=30 "${user}@${ip}" "${cmd}"
 }
 
 remote_scp() {
@@ -798,12 +942,12 @@ remote_scp() {
     cp -f "${src}" "${dst}"
     return $?
   fi
-  if ssh -o BatchMode=yes -o ConnectTimeout=8 "${user}@${ip}" "true" 2>/dev/null; then
-    scp -o BatchMode=yes -o ConnectTimeout=30 "${src}" "${user}@${ip}:${dst}"
+  if ssh -n -o BatchMode=yes -o ConnectTimeout=8 "${user}@${ip}" "true" 2>/dev/null; then
+    scp -o BatchMode=yes -o ConnectTimeout=30 "${src}" "${user}@${ip}:${dst}" </dev/null
     return $?
   fi
   [[ -n "${pass}" ]] || return 1
-  SSHPASS="${pass}" sshpass -e scp -o StrictHostKeyChecking=no -o ConnectTimeout=30 "${src}" "${user}@${ip}:${dst}"
+  SSHPASS="${pass}" sshpass -e scp -o StrictHostKeyChecking=no -o ConnectTimeout=30 "${src}" "${user}@${ip}:${dst}" </dev/null
 }
 
 cmd_vip_all() {
@@ -862,7 +1006,7 @@ cmd_vip_all() {
     fi
 
     if [[ -z "${pass}" ]]; then
-      if ! ssh -o BatchMode=yes -o ConnectTimeout=5 "${user}@${ip}" "true" 2>/dev/null; then
+      if ! ssh -n -o BatchMode=yes -o ConnectTimeout=5 "${user}@${ip}" "true" 2>/dev/null; then
         warn "跳过 ${ip}：无密码且无法免密 SSH，请先 ssh-keys 或填写 conf 密码"
         continue
       fi
@@ -960,13 +1104,14 @@ sync_install_to_node() {
 # 管理机一键：按 conf 把尚未入群的 worker 远程 join（自动建 token，无需手抄命令）
 cmd_join_workers() {
   need_root join-workers
-  local dry=0 do_prepare=0 only_ip=""
+  local dry=0 do_prepare=0 do_reset=0 only_ip=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --dry-run)  dry=1; shift ;;
       --prepare)  do_prepare=1; shift ;;
+      --reset)    do_reset=1; shift ;;
       --only=*)   only_ip="${1#*=}"; shift ;;
-      *) err "用法: $0 join-workers [--prepare] [--only=IP] [--dry-run]" ;;
+      *) err "用法: $0 join-workers [--prepare] [--reset] [--only=IP] [--dry-run]" ;;
     esac
   done
 
@@ -992,11 +1137,15 @@ cmd_join_workers() {
     fi
 
     if [[ "${dry}" == "1" ]]; then
-      echo "  DRY-RUN: join ${join_args}${do_prepare:+ (+ prepare)}"
+      echo "  DRY-RUN: join ${join_args}${do_reset:+ (+ reset)}${do_prepare:+ (+ prepare)}"
       continue
     fi
 
     if is_local_ip "${ip}"; then
+      if [[ "${do_reset}" == "1" ]] || [[ -f /etc/kubernetes/kubelet.conf ]]; then
+        log "清理本机旧集群残留后 join"
+        bash "${SCRIPT_DIR}/install-k8s-1.33.sh" reset --yes || true
+      fi
       if [[ "${do_prepare}" == "1" ]]; then
         bash "${SCRIPT_DIR}/install-k8s-1.33.sh" prepare || warn "本机 prepare 失败，继续尝试 join"
       fi
@@ -1011,7 +1160,7 @@ cmd_join_workers() {
       continue
     fi
 
-    if [[ -z "${pass}" ]] && ! ssh -o BatchMode=yes -o ConnectTimeout=5 "${user}@${ip}" "true" 2>/dev/null; then
+    if [[ -z "${pass}" ]] && ! ssh -n -o BatchMode=yes -o ConnectTimeout=5 "${user}@${ip}" "true" 2>/dev/null; then
       warn "跳过 ${ip}：无密码且无法免密 SSH"
       n_fail=$((n_fail + 1))
       continue
@@ -1022,6 +1171,14 @@ cmd_join_workers() {
       n_fail=$((n_fail + 1))
       continue
     }
+
+    # 未入群但有残留时自动 reset（或显式 --reset）
+    if [[ "${do_reset}" == "1" ]] \
+      || remote_ssh "${user}" "${ip}" "${pass}" "test -f /etc/kubernetes/kubelet.conf" 2>/dev/null; then
+      log "远程 reset（清理 kubelet.conf / 10250 残留）..."
+      remote_ssh "${user}" "${ip}" "${pass}" "cd ${remote_dir} && bash install-k8s-1.33.sh reset --yes" \
+        || warn "reset 失败，仍尝试 join"
+    fi
 
     if [[ "${do_prepare}" == "1" ]]; then
       log "远程 prepare ${ip} ..."
@@ -1116,7 +1273,7 @@ cmd_join_masters() {
       continue
     fi
 
-    if [[ -z "${pass}" ]] && ! ssh -o BatchMode=yes -o ConnectTimeout=5 "${user}@${ip}" "true" 2>/dev/null; then
+    if [[ -z "${pass}" ]] && ! ssh -n -o BatchMode=yes -o ConnectTimeout=5 "${user}@${ip}" "true" 2>/dev/null; then
       warn "跳过 ${ip}：无密码且无法免密 SSH"
       n_fail=$((n_fail + 1))
       continue
@@ -1210,16 +1367,119 @@ cmd_cni_flannel() {
 cmd_cni_calico() {
   need_root cni-calico
   export KUBECONFIG=/etc/kubernetes/admin.conf
-  local op_raw cr_raw
-  op_raw="https://raw.githubusercontent.com/projectcalico/calico/v3.29.3/manifests/tigera-operator.yaml"
-  cr_raw="https://raw.githubusercontent.com/projectcalico/calico/v3.29.3/manifests/custom-resources.yaml"
-  log "安装 Calico（经 GitHub 代理: ${GH_PROXY:-直连}）"
-  kubectl create -f "$(gh_url "${op_raw}")"
-  curl -fsSL "$(gh_url "${cr_raw}")" \
-    | sed "s|cidr: 192\.168\.0\.0/16|cidr: ${POD_CIDR}|" \
-    | kubectl apply -f -
-  warn "Calico operator 镜像若仍超时，请在官方文档配置 imagePath / registry 为国内仓库"
-  kubectl get pods -A | head -50
+  local op_raw cr_raw op_tmp cr_tmp
+  op_raw="https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/tigera-operator.yaml"
+  cr_raw="https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/custom-resources.yaml"
+  op_tmp="$(mktemp)"
+  cr_tmp="$(mktemp)"
+
+  log "安装 Calico ${CALICO_VERSION}（国内可用源：DaoCloud；阿里云公共仓无完整 Calico）"
+  log "  yaml 代理 : ${GH_PROXY:-直连}"
+  log "  operator  : ${QUAY_MIRROR}/tigera/operator"
+  log "  组件仓库  : ${CALICO_REGISTRY}/${CALICO_IMAGE_PATH}/..."
+
+  curl -fsSL "$(gh_url "${op_raw}")" -o "${op_tmp}" || err "下载 tigera-operator.yaml 失败"
+  sed -i \
+    -e "s|quay.io/|${QUAY_MIRROR}/|g" \
+    -e "s|docker.io/|${CALICO_REGISTRY}/|g" \
+    "${op_tmp}"
+
+  # 大 CRD 不能用客户端 apply（last-applied-configuration 注解会超 256KB）
+  # 必须用 server-side apply
+  if ! kubectl apply --server-side --force-conflicts -f "${op_tmp}"; then
+    warn "server-side apply 失败，尝试 replace CRDs + apply 其余资源"
+    kubectl replace --force -f "${op_tmp}" 2>/dev/null \
+      || kubectl create -f "${op_tmp}" 2>/dev/null \
+      || err "安装 tigera-operator 失败"
+  fi
+
+  curl -fsSL "$(gh_url "${cr_raw}")" -o "${cr_tmp}" || err "下载 custom-resources.yaml 失败"
+  sed -i "s|cidr: 192\.168\.0\.0/16|cidr: ${POD_CIDR}|" "${cr_tmp}"
+
+  # 写入/替换 registry、imagePath
+  if grep -qE '^[[:space:]]*registry:' "${cr_tmp}"; then
+    sed -i -E "s|^([[:space:]]*registry:).*|\1 ${CALICO_REGISTRY}|" "${cr_tmp}"
+  else
+    awk -v reg="${CALICO_REGISTRY}" '
+      /^spec:[[:space:]]*$/ { print; print "  registry: " reg; next }
+      { print }
+    ' "${cr_tmp}" >"${cr_tmp}.new" && mv "${cr_tmp}.new" "${cr_tmp}"
+  fi
+  if grep -qE '^[[:space:]]*imagePath:' "${cr_tmp}"; then
+    sed -i -E "s|^([[:space:]]*imagePath:).*|\1 ${CALICO_IMAGE_PATH}|" "${cr_tmp}"
+  else
+    awk -v path="${CALICO_IMAGE_PATH}" '
+      /^[[:space:]]*registry:/ { print; print "  imagePath: " path; next }
+      { print }
+    ' "${cr_tmp}" >"${cr_tmp}.new" && mv "${cr_tmp}.new" "${cr_tmp}"
+  fi
+
+  kubectl apply -f "${cr_tmp}"
+  rm -f "${op_tmp}" "${cr_tmp}"
+
+  log "确保 Installation 指向国内可用源（并清掉无效的阿里云公共路径）"
+  kubectl patch installation.operator.tigera.io default --type=merge \
+    -p "{\"spec\":{\"registry\":\"${CALICO_REGISTRY}\",\"imagePath\":\"${CALICO_IMAGE_PATH}\"}}" 2>/dev/null || true
+
+  if kubectl -n tigera-operator get deploy tigera-operator >/dev/null 2>&1; then
+    local dep
+    dep="$(mktemp)"
+    kubectl -n tigera-operator get deploy tigera-operator -o yaml >"${dep}"
+    sed -i \
+      -e "s|quay.io/|${QUAY_MIRROR}/|g" \
+      -e "s|docker.io/|${CALICO_REGISTRY}/|g" \
+      -e "s|registry.cn-hangzhou.aliyuncs.com/tigera/|${QUAY_MIRROR}/tigera/|g" \
+      -e "s|registry.cn-hangzhou.aliyuncs.com/calico/|${CALICO_REGISTRY}/calico/|g" \
+      -e "s|registry.aliyuncs.com/tigera/|${QUAY_MIRROR}/tigera/|g" \
+      "${dep}"
+    kubectl apply -f "${dep}" >/dev/null
+    rm -f "${dep}"
+  fi
+
+  log "重启异常 Pod，强制用新镜像拉取"
+  kubectl -n calico-system delete pods --all --force --grace-period=0 2>/dev/null || true
+  kubectl -n tigera-operator delete pods --field-selector=status.phase!=Running --force --grace-period=0 2>/dev/null || true
+
+  log "等待 tigera-operator / calico-system（拉镜像可能需几分钟）..."
+  kubectl -n tigera-operator rollout status deploy/tigera-operator --timeout=180s 2>/dev/null || true
+  echo
+  kubectl get pods -n tigera-operator -o wide 2>/dev/null || true
+  kubectl get pods -n calico-system -o wide 2>/dev/null || true
+  echo
+  log "核对镜像应含 ${CALICO_REGISTRY} 或 ${QUAY_MIRROR}："
+  echo "  kubectl get installation.operator.tigera.io default -o yaml | grep -E 'registry:|imagePath:'"
+  echo "  kubectl -n calico-system describe pod <失败pod> | grep -A5 'Failed'"
+  warn "若要用自有阿里云 ACR：先同步镜像，再 export CALICO_REGISTRY=你的ACR QUAY_MIRROR=你的ACR"
+}
+
+# 已安装但镜像仍是国外源时：只改 Installation.registry 并重启相关 Pod
+cmd_cni_calico_mirror() {
+  need_root cni-calico-mirror
+  export KUBECONFIG=/etc/kubernetes/admin.conf
+  log "将 Installation 切到国内可用源: ${CALICO_REGISTRY}/${CALICO_IMAGE_PATH}"
+  kubectl patch installation.operator.tigera.io default --type=merge \
+    -p "{\"spec\":{\"registry\":\"${CALICO_REGISTRY}\",\"imagePath\":\"${CALICO_IMAGE_PATH}\"}}" \
+    || err "patch Installation 失败（确认已装 Calico operator）"
+
+  log "将 tigera-operator Deployment 镜像改为 ${QUAY_MIRROR}"
+  local tmp
+  tmp="$(mktemp)"
+  kubectl -n tigera-operator get deploy tigera-operator -o yaml >"${tmp}"
+  sed -i \
+    -e "s|quay.io/|${QUAY_MIRROR}/|g" \
+    -e "s|docker.io/|${CALICO_REGISTRY}/|g" \
+    -e "s|registry.cn-hangzhou.aliyuncs.com/tigera/|${QUAY_MIRROR}/tigera/|g" \
+    -e "s|registry.cn-hangzhou.aliyuncs.com/calico/|${CALICO_REGISTRY}/calico/|g" \
+    -e "s|registry.aliyuncs.com/tigera/|${QUAY_MIRROR}/tigera/|g" \
+    "${tmp}"
+  kubectl apply -f "${tmp}"
+  rm -f "${tmp}"
+
+  kubectl -n calico-system delete pods --all --force --grace-period=0 2>/dev/null || true
+  kubectl -n tigera-operator delete pods --all --force --grace-period=0 2>/dev/null || true
+  sleep 3
+  kubectl get pods -n tigera-operator -o wide
+  kubectl get pods -n calico-system -o wide
 }
 
 cmd_status() {
@@ -1233,14 +1493,164 @@ cmd_status() {
 
 cmd_reset() {
   need_root reset
-  warn "将重置本机 kubeadm / 容器网络，5 秒后继续... Ctrl+C 取消"
-  sleep 5
+  local clean_vip=0 skip_wait=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --vip|--clean-vip) clean_vip=1; shift ;;
+      --yes|-y)          skip_wait=1; shift ;;
+      *) err "用法: $0 reset [--vip] [--yes]" ;;
+    esac
+  done
+  if [[ "${skip_wait}" != "1" ]]; then
+    warn "将重置本机 kubeadm / 容器网络${clean_vip:+（含 HAProxy/Keepalived）}，5 秒后继续... Ctrl+C 取消"
+    sleep 5
+  fi
+  do_node_cleanup "${clean_vip}"
+}
+
+# 本机彻底清理 Kubernetes（及可选 VIP 栈）
+do_node_cleanup() {
+  local clean_vip="${1:-0}"
+  log "执行 kubeadm reset ..."
   kubeadm reset -f || true
-  rm -rf /etc/cni/net.d /var/lib/cni /var/lib/kubelet/* || true
-  iptables -F && iptables -t nat -F && iptables -t mangle -F && iptables -X || true
+
+  log "清理 kubelet / CNI / etcd 残留"
+  systemctl stop kubelet 2>/dev/null || true
+  rm -rf \
+    /etc/cni/net.d \
+    /var/lib/cni \
+    /var/lib/kubelet/* \
+    /var/lib/etcd \
+    /etc/kubernetes \
+    /root/.kube \
+    /var/lib/calico \
+    /var/lib/kube-proxy \
+    2>/dev/null || true
+
+  iptables -F 2>/dev/null || true
+  iptables -t nat -F 2>/dev/null || true
+  iptables -t mangle -F 2>/dev/null || true
+  iptables -X 2>/dev/null || true
   ipvsadm -C 2>/dev/null || true
-  systemctl restart containerd || true
-  log "已 reset。可再执行: sudo bash $0 prepare"
+  ip link delete cni0 2>/dev/null || true
+  ip link delete flannel.1 2>/dev/null || true
+  ip link delete tunl0 2>/dev/null || true
+  ip link delete vxlan.calico 2>/dev/null || true
+
+  if [[ "${clean_vip}" == "1" ]]; then
+    log "清理 HAProxy / Keepalived（VIP）"
+    systemctl stop keepalived haproxy 2>/dev/null || true
+    systemctl disable keepalived haproxy 2>/dev/null || true
+    rm -f /etc/keepalived/keepalived.conf /etc/haproxy/haproxy.cfg \
+      /etc/sysctl.d/99-vip-nonlocal.conf /etc/keepalived/check_haproxy.sh \
+      2>/dev/null || true
+    # 若本机仍挂着 VIP，尝试摘掉（忽略失败）
+    local vip
+    vip="$(default_vip_ip 2>/dev/null || true)"
+    if [[ -n "${vip}" ]]; then
+      ip addr del "${vip}/32" dev "$(ip -br route show default 2>/dev/null | awk '{print $5; exit}')" 2>/dev/null || true
+    fi
+  fi
+
+  systemctl restart containerd 2>/dev/null || true
+  systemctl restart kubelet 2>/dev/null || true
+  log "本机已清理完成。需要重建时再执行: sudo bash $0 prepare"
+}
+
+# 管理机一键：按 conf 清理全部 master + worker（删除集群）
+cmd_reset_all() {
+  need_root reset-all
+  local dry=0 skip_wait=0 only_ip="" clean_vip=1
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run)     dry=1; shift ;;
+      --yes|-y)      skip_wait=1; shift ;;
+      --only=*)      only_ip="${1#*=}"; shift ;;
+      --keep-vip)    clean_vip=0; shift ;;
+      --vip|--clean-vip) clean_vip=1; shift ;;
+      *) err "用法: $0 reset-all [--yes] [--keep-vip] [--only=IP] [--dry-run]" ;;
+    esac
+  done
+
+  [[ -f "${K8S_NODES_FILE}" ]] || err "需要 ${K8S_NODES_FILE}"
+  [[ -f "${SCRIPT_DIR}/install-k8s-1.33.sh" ]] || err "找不到安装脚本"
+
+  ensure_sshpass
+
+  local targets
+  targets="$(list_ssh_nodes | awk -F'|' -v o="${only_ip}" '
+    (tolower($3)=="master" || tolower($3)=="worker") && (o=="" || $1==o) { print }
+  ')"
+  [[ -n "${targets}" ]] || err "节点表中没有可清理的 master/worker"
+
+  log "将清理以下节点的 Kubernetes${clean_vip:+（Master 含 VIP 组件）}："
+  echo "${targets}" | awk -F'|' '{printf "  - %s@%s (%s) [%s]\n", $4, $1, $2, $3}'
+  echo
+
+  if [[ "${dry}" == "1" ]]; then
+    log "DRY-RUN：不会执行清理"
+    return 0
+  fi
+
+  if [[ "${skip_wait}" != "1" ]]; then
+    warn "危险操作：删除整个集群并清理全部节点，10 秒后继续... Ctrl+C 取消"
+    warn "跳过等待请加: --yes"
+    sleep 10
+  fi
+
+  local ip host role user pass remote_dir remote_cmd n_ok=0 n_fail=0
+  local -a reset_args=(--yes)
+  [[ "${clean_vip}" == "1" ]] && reset_args+=(--vip)
+  remote_dir="/opt/service/k8s"
+
+  while IFS='|' read -r ip host role user pass; do
+    [[ -n "${ip}" ]] || continue
+    log "======== 清理 ${user}@${ip} (${host}) [${role}] ========"
+
+    if is_local_ip "${ip}"; then
+      if bash "${SCRIPT_DIR}/install-k8s-1.33.sh" reset "${reset_args[@]}"; then
+        log "OK 本机已清理"
+        n_ok=$((n_ok + 1))
+      else
+        warn "FAIL 本机清理"
+        n_fail=$((n_fail + 1))
+      fi
+      continue
+    fi
+
+    if [[ -z "${pass}" ]] && ! ssh -n -o BatchMode=yes -o ConnectTimeout=5 "${user}@${ip}" "true" 2>/dev/null; then
+      warn "跳过 ${ip}：无密码且无法免密 SSH"
+      n_fail=$((n_fail + 1))
+      continue
+    fi
+
+    sync_install_to_node "${user}" "${ip}" "${pass}" "${remote_dir}" || {
+      # 无脚本时仍尝试直接 kubeadm reset
+      warn "同步脚本失败，尝试远程直接 kubeadm reset"
+      if remote_ssh "${user}" "${ip}" "${pass}" "kubeadm reset -f; rm -rf /etc/kubernetes /etc/cni/net.d /var/lib/cni /var/lib/kubelet/* /var/lib/etcd /root/.kube; systemctl restart containerd || true"; then
+        log "OK ${host}（简易清理）"
+        n_ok=$((n_ok + 1))
+      else
+        warn "FAIL ${host}"
+        n_fail=$((n_fail + 1))
+      fi
+      continue
+    }
+
+    remote_cmd="cd ${remote_dir} && bash install-k8s-1.33.sh reset ${reset_args[*]}"
+    if remote_ssh "${user}" "${ip}" "${pass}" "${remote_cmd}"; then
+      log "OK ${host} (${ip})"
+      n_ok=$((n_ok + 1))
+    else
+      warn "FAIL ${host} (${ip})"
+      n_fail=$((n_fail + 1))
+    fi
+    echo
+  done < <(printf '%s\n' "${targets}")
+
+  echo
+  log "reset-all 结束：成功=${n_ok} 失败=${n_fail}"
+  echo "重建顺序：各节点 prepare → ssh-keys → vip-all → Master-1 init → cni-calico → join-all"
 }
 
 usage() {
@@ -1249,16 +1659,18 @@ Ubuntu 24 + Kubernetes ${K8S_MINOR}（kubeadm，默认国内镜像，可配置�
 
 用法:
   sudo bash $0 prepare
-  sudo bash $0 hosts | nodes | ssh-keys
+  sudo bash $0 hosts | hosts-all [--only=IP]       # hosts-all：管理机一键刷新全部节点
+  sudo bash $0 nodes | ssh-keys
   sudo bash $0 vip [--iface=网卡] [--priority=100]   # 仅本机
   sudo bash $0 vip-all [--iface=网卡]              # 管理机一键部署全部 Master（读 conf）
   sudo bash $0 init --apiserver-advertise-address=<本机IP> --control-plane-endpoint=<VIP:8443>
-  sudo bash $0 cni-calico                                      # 默认网络插件（也可 cni-flannel）
+  sudo bash $0 cni-calico                                      # Calico（默认国内镜像）
   sudo bash $0 join <VIP>:8443 --token ... --discovery-token-ca-cert-hash sha256:...
   sudo bash $0 join-masters [--prepare] [--no-vip] [--only=IP]   # 管理机一键加 Master（自动 token/证书）
-  sudo bash $0 join-workers [--prepare] [--only=IP]            # 管理机一键加 Worker
+  sudo bash $0 join-workers [--prepare] [--reset] [--only=IP]   # 管理机一键加 Worker
   sudo bash $0 join-all [--prepare]                            # 先 Master 后 Worker
-  sudo bash $0 status | reset
+  sudo bash $0 status | reset [--vip] [--yes]
+  sudo bash $0 reset-all [--yes] [--keep-vip] [--only=IP]   # 管理机一键清理全部节点
 
 节点表（增删改只改表，然后 hosts + vip + join）:
   文件: ${K8S_NODES_FILE}
@@ -1276,6 +1688,7 @@ main() {
   case "${cmd}" in
     prepare)     cmd_prepare "$@" ;;
     hosts)       cmd_hosts "$@" ;;
+    hosts-all)   cmd_hosts_all "$@" ;;
     nodes)       cmd_nodes "$@" ;;
     ssh-keys)    cmd_ssh_keys "$@" ;;
     vip)         cmd_vip "$@" ;;
@@ -1287,8 +1700,10 @@ main() {
     join-all)     cmd_join_all "$@" ;;
     cni-flannel)  cmd_cni_flannel "$@" ;;
     cni-calico)  cmd_cni_calico "$@" ;;
+    cni-calico-mirror) cmd_cni_calico_mirror "$@" ;;
     status)      cmd_status "$@" ;;
     reset)       cmd_reset "$@" ;;
+    reset-all)   cmd_reset_all "$@" ;;
     -h|--help|help|"") usage ;;
     *) err "未知命令: ${cmd}（--help 查看用法）" ;;
   esac
