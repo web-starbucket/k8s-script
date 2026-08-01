@@ -1570,10 +1570,20 @@ cmd_reset() {
 do_node_cleanup() {
   local clean_vip="${1:-0}"
   log "执行 kubeadm reset ..."
-  kubeadm reset -f || true
+  # reset-all / 集群已坏时 etcd 常 unhealthy，remove-etcd-member 会长时间重试；
+  # 本脚本随后会 rm -rf /var/lib/etcd，故跳过该阶段，只做本机清理。
+  if kubeadm reset -h 2>&1 | grep -q -- '--skip-phases'; then
+    kubeadm reset -f --skip-phases=remove-etcd-member || true
+  else
+    kubeadm reset -f || true
+  fi
 
   log "清理 kubelet / CNI / etcd 残留"
   systemctl stop kubelet 2>/dev/null || true
+  # 停掉静态 Pod 相关容器，避免占用端口/文件
+  crictl stopp $(crictl pods -q) 2>/dev/null || true
+  crictl rmp $(crictl pods -q) 2>/dev/null || true
+
   rm -rf \
     /etc/cni/net.d \
     /var/lib/cni \
@@ -1682,7 +1692,7 @@ cmd_reset_all() {
 
     sync_install_to_node "${user}" "${ip}" "${pass}" "${remote_dir}" || {
       warn "同步脚本失败，尝试远程直接 kubeadm reset"
-      if remote_ssh "${user}" "${ip}" "${pass}" "kubeadm reset -f; rm -rf /etc/kubernetes /etc/cni/net.d /var/lib/cni /var/lib/kubelet/* /var/lib/etcd /root/.kube; systemctl restart containerd || true"; then
+      if remote_ssh "${user}" "${ip}" "${pass}" "kubeadm reset -f --skip-phases=remove-etcd-member 2>/dev/null || kubeadm reset -f; rm -rf /etc/kubernetes /etc/cni/net.d /var/lib/cni /var/lib/kubelet/* /var/lib/etcd /root/.kube; systemctl restart containerd || true"; then
         log "OK ${host}（简易清理）"
         n_ok=$((n_ok + 1))
       else

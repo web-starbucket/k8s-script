@@ -1,0 +1,272 @@
+# =============================================================================
+# 监控一体配置（Prometheus + Grafana + Alertmanager + Loki + Promtail）
+# 使用：bash install.sh
+# =============================================================================
+
+nfs:
+  server: 172.16.10.120
+  basePath: /data/nfs/monitoring
+
+# ----- kube-prometheus-stack -----
+kubePrometheus:
+  fullnameOverride: monitoring
+  defaultRules:
+    create: true
+  grafana:
+    enabled: true
+    adminUser: admin
+    adminPassword: admin123456
+    image:
+      registry: swr.cn-north-4.myhuaweicloud.com
+      repository: ddn-k8s/docker.io/grafana/grafana
+      tag: "11.5.2"
+      pullPolicy: IfNotPresent
+    grafana.ini:
+      users:
+        default_language: zh-Hans
+    sidecar:
+      image:
+        registry: swr.cn-north-4.myhuaweicloud.com
+        repository: ddn-k8s/quay.io/kiwigrid/k8s-sidecar
+        tag: "1.28.0"
+      datasources:
+        enabled: true
+    additionalDataSources:
+      - name: Loki
+        type: loki
+        uid: loki
+        access: proxy
+        url: http://loki-gateway.monitoring.svc.cluster.local
+        isDefault: false
+        jsonData:
+          maxLines: 1000
+          timeout: 60
+    initChownData:
+      enabled: false
+      image:
+        registry: swr.cn-north-4.myhuaweicloud.com
+        repository: ddn-k8s/docker.io/library/busybox
+        tag: "1.36.1"
+    service:
+      type: NodePort
+      nodePort: 30300
+    persistence:
+      enabled: true
+      type: pvc
+      existingClaim: data-grafana
+  alertmanager:
+    enabled: true
+    service:
+      type: NodePort
+      nodePort: 30303
+    alertmanagerSpec:
+      replicas: 1
+      image:
+        registry: swr.cn-north-4.myhuaweicloud.com
+        repository: ddn-k8s/quay.io/prometheus/alertmanager
+        tag: "v0.27.0"
+      storage:
+        volumeClaimTemplate:
+          spec:
+            storageClassName: ""
+            volumeName: pv-mon-alertmanager
+            accessModes: ["ReadWriteMany"]
+            resources:
+              requests:
+                storage: 5Gi
+  prometheus:
+    enabled: true
+    service:
+      type: NodePort
+      nodePort: 30390
+    prometheusSpec:
+      replicas: 1
+      retention: 15d
+      scrapeInterval: 30s
+      evaluationInterval: 30s
+      image:
+        registry: swr.cn-north-4.myhuaweicloud.com
+        repository: ddn-k8s/quay.io/prometheus/prometheus
+        tag: "v2.54.1"
+      storageSpec:
+        volumeClaimTemplate:
+          spec:
+            storageClassName: ""
+            volumeName: pv-mon-prometheus
+            accessModes: ["ReadWriteMany"]
+            resources:
+              requests:
+                storage: 50Gi
+      resources:
+        requests:
+          cpu: 500m
+          memory: 2Gi
+        limits:
+          cpu: "2"
+          memory: 4Gi
+  prometheusOperator:
+    enabled: true
+    admissionWebhooks:
+      enabled: false
+      patch:
+        enabled: false
+    tls:
+      enabled: false
+    image:
+      registry: registry.cn-chengdu.aliyuncs.com
+      repository: obsbot/prometheus-operator
+      tag: "v0.77.2"
+    prometheusConfigReloader:
+      image:
+        registry: registry.cn-chengdu.aliyuncs.com
+        repository: obsbot/prometheus-config-reloader
+        tag: "v0.77.2"
+  kube-state-metrics:
+    enabled: true
+    image:
+      registry: swr.cn-north-4.myhuaweicloud.com
+      repository: ddn-k8s/registry.k8s.io/kube-state-metrics/kube-state-metrics
+      tag: "v2.13.0"
+  prometheus-node-exporter:
+    enabled: true
+    image:
+      registry: registry.cn-chengdu.aliyuncs.com
+      repository: obsbot/node-exporter
+      # 必须写死；chart 默认是 v1.8.2-distroless，obsbot 没有该 tag
+      tag: "v1.8.2"
+      digest: ""
+      pullPolicy: IfNotPresent
+  kubeEtcd:
+    enabled: false
+  kubeControllerManager:
+    enabled: false
+  kubeScheduler:
+    enabled: false
+  kubeProxy:
+    enabled: true
+  kubelet:
+    enabled: true
+  coreDns:
+    enabled: true
+  kubeApiServer:
+    enabled: true
+
+# ----- Loki -----
+loki:
+  deploymentMode: SingleBinary
+  loki:
+    auth_enabled: false
+    commonConfig:
+      replication_factor: 1
+    schemaConfig:
+      configs:
+        - from: "2024-01-01"
+          store: tsdb
+          object_store: filesystem
+          schema: v13
+          index:
+            prefix: index_
+            period: 24h
+    storage:
+      type: filesystem
+    # 日志保留约 2 个月，到期由 Compactor 自动删除
+    limits_config:
+      retention_period: 1440h   # 60d
+    compactor:
+      working_directory: /var/loki/compactor
+      compaction_interval: 10m
+      retention_enabled: true
+      retention_delete_delay: 2h
+      delete_request_store: filesystem
+    image:
+      registry: registry.cn-chengdu.aliyuncs.com
+      repository: obsbot/loki
+      tag: "3.3.2"
+  singleBinary:
+    replicas: 1
+    # StatefulSet PVC 名固定为 storage-loki-0（install.sh 预建并绑 pv-mon-loki）
+    persistence:
+      enabled: true
+      size: 50Gi
+      storageClass: ""
+      enableStatefulSetAutoDeletePVC: false
+      whenDeleted: Retain
+      whenScaled: Retain
+      # 部分 chart 版本支持；与预建 PVC / NFS PV 保持一致
+      accessModes:
+        - ReadWriteMany
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: "1"
+        memory: 2Gi
+  # 关闭规则 sidecar（会拉 docker.io/kiwigrid/k8s-sidecar）
+  sidecar:
+    image:
+      repository: kiwigrid/k8s-sidecar
+    rules:
+      enabled: false
+  read:
+    replicas: 0
+    persistence:
+      enabled: false
+  write:
+    replicas: 0
+    persistence:
+      enabled: false
+      volumeClaimsEnabled: false
+  backend:
+    replicas: 0
+    persistence:
+      enabled: false
+      volumeClaimsEnabled: false
+  gateway:
+    enabled: true
+    service:
+      type: ClusterIP
+  chunksCache:
+    enabled: false
+  resultsCache:
+    enabled: false
+  test:
+    enabled: false
+  lokiCanary:
+    enabled: false
+  monitoring:
+    selfMonitoring:
+      enabled: false
+      grafanaAgent:
+        installOperator: false
+    lokiCanary:
+      enabled: false
+    rules:
+      enabled: false
+
+
+# ----- Promtail -----
+promtail:
+  image:
+    registry: registry.cn-chengdu.aliyuncs.com
+    repository: obsbot/promtail
+    tag: "3.3.2"
+  config:
+    clients:
+      - url: http://loki-gateway.monitoring.svc.cluster.local/loki/api/v1/push
+        tenant_id: fake
+    snippets:
+      pipelineStages:
+        - cri: {}
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+  tolerations:
+    - effect: NoSchedule
+      operator: Exists
+    - effect: NoExecute
+      operator: Exists
