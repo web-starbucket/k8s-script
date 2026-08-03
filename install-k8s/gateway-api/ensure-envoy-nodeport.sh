@@ -38,8 +38,8 @@ need kubectl
 
 step 1 3 "应用 EnvoyProxy（固化 NodePort + Cluster）"
 # 与安装脚本一致用 server-side，避免 last-applied-configuration 警告
-kubectl apply --server-side --force-conflicts -f "${SCRIPT_DIR}/eg-proxy-obsbot.yaml"
-ok "eg-proxy-obsbot.yaml 已应用"
+kubectl apply --server-side --force-conflicts -f "${SCRIPT_DIR}/eg-proxy.yaml"
+ok "eg-proxy.yaml 已应用"
 
 step 2 3 "查找数据面 Service"
 search "label: owning-gateway=${GW_NS}/${GW_NAME}"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 安装 RouteBoard（需已把镜像推到 Obsbot，或临时改 YAML 用 ghcr）
+# 安装 RouteBoard（可按需改 YAML 中的镜像地址）
 set -euo pipefail
 
 # ── 日志 ──────────────────────────────────────────────

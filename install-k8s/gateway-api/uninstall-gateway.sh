@@ -178,7 +178,7 @@ fi
 
 if [[ "${fail}" -eq 0 ]]; then
   done_ "卸载完成，已清理干净" \
-    "重新安装: bash install-eg-obsbot.sh"
+    "重新安装: bash install-eg.sh"
   exit 0
 else
   fail_ "仍有残留" \

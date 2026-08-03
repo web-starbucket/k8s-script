@@ -1,0 +1,34 @@
+# 数据面 Envoy 镜像 + 裸机 NodePort（externalTrafficPolicy=Cluster）
+# 默认官方镜像；私有仓可 export IMAGE_REGISTRY=registry.example.com/myproj 后由 install-eg.sh 替换
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: eg-proxy
+  namespace: envoy-gateway-system
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyDeployment:
+        container:
+          image: docker.io/envoyproxy/envoy:distroless-v1.38.0
+      envoyService:
+        type: NodePort
+        patch:
+          type: StrategicMerge
+          value:
+            spec:
+              type: NodePort
+              externalTrafficPolicy: Cluster
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: eg
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+  parametersRef:
+    group: gateway.envoyproxy.io
+    kind: EnvoyProxy
+    name: eg-proxy
+    namespace: envoy-gateway-system

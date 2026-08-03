@@ -1,0 +1,11 @@
+# Envoy Gateway v1.8.2 Helm values（官方镜像）
+# 私有仓请自行改 image，或安装前设置 IMAGE_REGISTRY
+# 配套: Gateway API CRD v1.5.1，K8s 1.33
+global:
+  images:
+    envoyGateway:
+      image: docker.io/envoyproxy/gateway:v1.8.2
+    envoyProxy:
+      image: docker.io/envoyproxy/envoy:distroless-v1.38.0
+    ratelimit:
+      image: docker.io/envoyproxy/ratelimit:1e50889b

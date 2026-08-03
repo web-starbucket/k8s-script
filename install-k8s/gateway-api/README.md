@@ -1,4 +1,4 @@
-## Gateway API + Envoy Gateway（K8s 1.33 / Obsbot 成都仓）
+## Gateway API + Envoy Gateway（K8s 1.33）
 
 ### 推荐版本
 
@@ -10,35 +10,36 @@
 | Envoy Proxy | distroless-v1.38.0 |
 | Rate Limit | 1e50889b |
 
-镜像仓库前缀：`registry.cn-chengdu.aliyuncs.com/obsbot/`（镜像名不含 `envoyproxy/`）
+默认使用官方镜像 `docker.io/envoyproxy/...`。内网环境可设 `IMAGE_REGISTRY` / `PRIVATE_REGISTRY` 指向私有仓（镜像名为 `gateway` / `envoy` / `ratelimit`，不含 `envoyproxy/` 路径前缀）。
 
 ### 脚本一览
 
 | 脚本 | 作用 |
 |------|------|
-| `sync-images-to-obsbot.sh` | 把官方镜像同步到 Obsbot |
-| `install-eg-obsbot.sh` | 一键安装 Gateway API + Envoy Gateway |
+| `sync-images.sh` | （可选）把官方镜像同步到私有仓 |
+| `install-eg.sh` | 一键安装 Gateway API + Envoy Gateway |
 | `uninstall-gateway.sh` | **一键彻底卸载**（CRD / 命名空间 / Webhook / RBAC） |
-| `eg-values-obsbot.yaml` | Helm values（Obsbot 镜像） |
-| `eg-proxy-obsbot.yaml` | 数据面镜像 + GatewayClass（**强制 NodePort + Cluster**） |
+| `eg-values.yaml` | Helm values |
+| `eg-proxy.yaml` | 数据面镜像 + GatewayClass（**强制 NodePort + Cluster**） |
 | `ensure-envoy-nodeport.sh` | 创建 Gateway 后纠正 Service，保证**所有节点**可访问 |
 
 ---
 
-### 1. 同步镜像到 Obsbot
+### 1. （可选）同步镜像到私有仓
 
 ```bash
-docker login registry.cn-chengdu.aliyuncs.com
-bash sync-images-to-obsbot.sh
+export PRIVATE_REGISTRY=registry.example.com/myproj
+docker login <你的仓库域名>
+bash sync-images.sh
 ```
 
-同步后的镜像：
+同步后的镜像形如：
 
 ```text
-registry.cn-chengdu.aliyuncs.com/obsbot/gateway:v1.8.2
-registry.cn-chengdu.aliyuncs.com/obsbot/envoy:distroless-v1.38.0
-registry.cn-chengdu.aliyuncs.com/obsbot/ratelimit:1e50889b
-registry.cn-chengdu.aliyuncs.com/obsbot/ratelimit:fe26676d
+${PRIVATE_REGISTRY}/gateway:v1.8.2
+${PRIVATE_REGISTRY}/envoy:distroless-v1.38.0
+${PRIVATE_REGISTRY}/ratelimit:1e50889b
+${PRIVATE_REGISTRY}/ratelimit:fe26676d
 ```
 
 ---
@@ -47,12 +48,15 @@ registry.cn-chengdu.aliyuncs.com/obsbot/ratelimit:fe26676d
 
 ```bash
 export GH_PROXY="${GH_PROXY:-https://ghfast.top/}"
-bash install-eg-obsbot.sh
+# 可选：使用私有仓（与 sync-images.sh 的 PRIVATE_REGISTRY 一致）
+# export IMAGE_REGISTRY=registry.example.com/myproj
+bash install-eg.sh
 ```
 
 说明：
 - 使用 Gateway API **standard** v1.5.1（不要装 experimental）
-- 使用 Obsbot 镜像，不依赖 `docker.io` 拉 helm chart
+- 未设置 `IMAGE_REGISTRY` 时用官方镜像；设置后自动替换控制器与数据面镜像
+- 不依赖 `docker.io` 拉 Helm chart（直接用 GitHub release 的 install.yaml）
 - CRD / 控制器清单一律拆成**单资源文件**，**严格串行** `kubectl apply`（禁止整包并行，降低 etcd 超时）
 - 每个 CRD 会等到 `Established` 后再处理下一个
 - 下载失败会自动换 GitHub 代理；脚本内已设置版本号，**不要**在 shell 里用空的 `${GATEWAY_API_VERSION}` / `${TMPDIR}` 手敲 curl
@@ -74,10 +78,10 @@ kubectl get --raw=/readyz
 
 # 2) 直接重跑即可（已应用的 CRD 会跳过/幂等；全程串行）
 export KUBECTL_TIMEOUT=300s APPLY_RETRIES=8 APPLY_SLEEP=5
-bash install-eg-obsbot.sh
+bash install-eg.sh
 ```
 
-可选环境变量：`KUBECTL_TIMEOUT`（默认 180s）、`APPLY_RETRIES`（默认 6）、`APPLY_SLEEP`（默认 3 秒）。
+可选环境变量：`KUBECTL_TIMEOUT`（默认 180s）、`APPLY_RETRIES`（默认 6）、`APPLY_SLEEP`（默认 3 秒）、`IMAGE_REGISTRY`（私有仓前缀）。
 
 安装后创建入口，并**立刻**纠正数据面 Service：
 
@@ -134,7 +138,7 @@ http://172.16.10.114:32030/   # 不通
 | `spec.externalTrafficPolicy` | **`Cluster`** | 任意节点 IP:NodePort 都转发到 Envoy |
 | NodePort | 如 `32030`（自动分配） | 所有节点共用同一 NodePort 号 |
 
-`eg-proxy-obsbot.yaml` 已写入上述策略；创建 Gateway 后再执行一次：
+`eg-proxy.yaml` 已写入上述策略；创建 Gateway 后再执行一次：
 
 ```bash
 bash ensure-envoy-nodeport.sh
@@ -211,7 +215,7 @@ bash uninstall-gateway.sh --yes
 重装：
 
 ```bash
-bash install-eg-obsbot.sh
+bash install-eg.sh
 ```
 
 重装后创建 Gateway，**务必再执行** `bash ensure-envoy-nodeport.sh`。
@@ -412,7 +416,7 @@ kubectl -n envoy-gateway-system logs \
 kubectl -n envoy-gateway-system logs -f deploy/envoy-gateway
 ```
 
-默认访问日志打到 Envoy 容器 stdout；若要改格式或送到 Loki/OTel，在 `EnvoyProxy`（如 `eg-proxy-obsbot`）里配 `spec.telemetry.accessLog`。
+默认访问日志打到 Envoy 容器 stdout；若要改格式或送到 Loki/OTel，在 `EnvoyProxy`（如 `eg-proxy`）里配 `spec.telemetry.accessLog`。
 
 #### 6.1 让响应头返回 `x-request-id`（排障用）
 
