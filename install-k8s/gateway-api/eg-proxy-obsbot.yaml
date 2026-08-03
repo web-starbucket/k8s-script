@@ -1,0 +1,35 @@
+# 数据面走 Obsbot 镜像
+# 裸机必配：NodePort + externalTrafficPolicy=Cluster
+# 否则默认 Local 时，只有跑着 Envoy Pod 的那一个节点 NodePort 能访问
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: eg-proxy-obsbot
+  namespace: envoy-gateway-system
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyDeployment:
+        container:
+          image: registry.cn-chengdu.aliyuncs.com/obsbot/envoy:distroless-v1.38.0
+      envoyService:
+        type: NodePort
+        patch:
+          type: StrategicMerge
+          value:
+            spec:
+              type: NodePort
+              externalTrafficPolicy: Cluster
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: eg
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+  parametersRef:
+    group: gateway.envoyproxy.io
+    kind: EnvoyProxy
+    name: eg-proxy-obsbot
+    namespace: envoy-gateway-system

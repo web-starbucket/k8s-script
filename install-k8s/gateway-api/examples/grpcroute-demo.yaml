@@ -1,0 +1,28 @@
+# 示例：gRPC 业务挂到同一 Gateway eg（走 HTTP/2）
+# Gateway listener 用 protocol: HTTP（明文 h2c）或 HTTPS（TLS）均可
+# 客户端需带正确 authority/Host，例如 grpc.example.com
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: demo-grpc
+  namespace: default
+spec:
+  parentRefs:
+    - name: eg
+      namespace: default
+      # sectionName: http
+  hostnames:
+    - "grpc.example.com"
+  rules:
+    # 匹配指定 gRPC 方法
+    - matches:
+        - method:
+            service: helloworld.Greeter
+            method: SayHello
+      backendRefs:
+        - name: grpc-svc
+          port: 9000
+    # 其余方法可再写一条，或单独一条不写 matches 做默认转发
+    - backendRefs:
+        - name: grpc-svc
+          port: 9000

@@ -1,0 +1,27 @@
+# Gateway 同时开 HTTP（可挂 HTTPRoute + GRPCRoute）
+# 应用后执行: bash ensure-envoy-nodeport.sh
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: eg
+  namespace: default
+spec:
+  gatewayClassName: eg
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: All
+    # 若 gRPC 要 TLS，再加 HTTPS listener（需证书 Secret）
+    # - name: https
+    #   protocol: HTTPS
+    #   port: 443
+    #   tls:
+    #     mode: Terminate
+    #     certificateRefs:
+    #       - name: demo-tls
+    #   allowedRoutes:
+    #     namespaces:
+    #       from: All

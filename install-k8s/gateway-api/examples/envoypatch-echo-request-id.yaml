@@ -1,0 +1,33 @@
+# 强制在响应头返回 x-request-id（便于用响应头反查访问日志）
+# 前提：Envoy Gateway 已开启 EnvoyPatchPolicy
+#   extensionApis:
+#     enableEnvoyPatchPolicy: true
+#
+# listener 名: <Gateway命名空间>/<Gateway名>/<listener名>
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyPatchPolicy
+metadata:
+  name: echo-request-id
+  namespace: default
+spec:
+  type: JSONPatch
+  priority: 100
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: Gateway
+    name: eg
+  jsonPatches:
+    # 始终在响应中带上 X-Request-ID（默认 false：客户端没带则响应也不回）
+    - type: type.googleapis.com/envoy.config.listener.v3.Listener
+      name: default/eg/http
+      operation:
+        op: add
+        path: /default_filter_chain/filters/0/typed_config/always_set_request_id_in_response
+        value: true
+    # 确保生成请求 ID（一般默认已开；显式加上更稳）
+    - type: type.googleapis.com/envoy.config.listener.v3.Listener
+      name: default/eg/http
+      operation:
+        op: add
+        path: /default_filter_chain/filters/0/typed_config/generate_request_id
+        value: true

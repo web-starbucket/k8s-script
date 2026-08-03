@@ -1,0 +1,28 @@
+# Envoy 层强制覆盖 Server（ResponseHeaderModifier / late headers 对 Server 常无效时用）
+# 前提：控制器已开启 EnvoyPatchPolicy（见下方说明）
+# listener 名格式: <Gateway命名空间>/<Gateway名>/<listener名>
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyPatchPolicy
+metadata:
+  name: overwrite-server-header
+  namespace: default
+spec:
+  type: JSONPatch
+  priority: 100
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: Gateway
+    name: eg
+  jsonPatches:
+    - type: type.googleapis.com/envoy.config.listener.v3.Listener
+      name: default/eg/http
+      operation:
+        op: add
+        path: /default_filter_chain/filters/0/typed_config/server_name
+        value: Gateway
+    - type: type.googleapis.com/envoy.config.listener.v3.Listener
+      name: default/eg/http
+      operation:
+        op: add
+        path: /default_filter_chain/filters/0/typed_config/server_header_transformation
+        value: OVERWRITE

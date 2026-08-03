@@ -1,0 +1,10 @@
+# Envoy Gateway v1.8.2 — 使用 Obsbot 成都镜像库（无 envoyproxy/ 前缀）
+# 配套: Gateway API CRD v1.5.1，K8s 1.33
+global:
+  images:
+    envoyGateway:
+      image: registry.cn-chengdu.aliyuncs.com/obsbot/gateway:v1.8.2
+    envoyProxy:
+      image: registry.cn-chengdu.aliyuncs.com/obsbot/envoy:distroless-v1.38.0
+    ratelimit:
+      image: registry.cn-chengdu.aliyuncs.com/obsbot/ratelimit:1e50889b

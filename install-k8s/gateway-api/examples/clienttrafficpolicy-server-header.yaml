@@ -1,0 +1,17 @@
+# 全局改写响应头 Server → Gateway（挂到 Gateway eg）
+# 先试这个；若 curl 仍看到 nginx，再用同目录 envoypatch-server-header.yaml
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: ClientTrafficPolicy
+metadata:
+  name: set-server-header
+  namespace: default
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: eg
+  headers:
+    lateResponseHeaders:
+      set:
+        - name: X-Web-Server
+          value: Gateway
