@@ -16,8 +16,12 @@ K8S_MINOR_DEFAULT="1.33"
 # 环境变量优先于 conf；未设置时从 conf 读 K8S_MINOR / KUBE_VERSION
 _ENV_K8S_MINOR="${K8S_MINOR-}"
 _ENV_KUBE_VERSION="${KUBE_VERSION-}"
+_ENV_IMAGE_MIRROR="${IMAGE_MIRROR-}"
+_ENV_IMAGE_REPOSITORY="${IMAGE_REPOSITORY-}"
+_ENV_PAUSE_IMAGE="${PAUSE_IMAGE-}"
 _CONF_K8S_MINOR=""
 _CONF_KUBE_VERSION=""
+_CONF_IMAGE_MIRROR=""
 
 is_conf_kv_line() {
   [[ "${1:-}" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]
@@ -95,6 +99,7 @@ load_conf_kv() {
     case "${key}" in
       K8S_MINOR|K8S_VERSION) _CONF_K8S_MINOR="${val}" ;;
       KUBE_VERSION) _CONF_KUBE_VERSION="${val}" ;;
+      IMAGE_MIRROR) _CONF_IMAGE_MIRROR="${val}" ;;
     esac
   done <"${f}"
 }
@@ -134,8 +139,34 @@ K8S_APT_MIRROR="${K8S_APT_MIRROR:-https://mirrors.aliyun.com/kubernetes-new/core
 K8S_APT_KEY_URL="${K8S_APT_KEY_URL:-https://mirrors.aliyun.com/kubernetes-new/core/stable/v${K8S_MINOR}/deb/Release.key}"
 K8S_APT_MIRROR_FALLBACK="${K8S_APT_MIRROR_FALLBACK:-https://pkgs.k8s.io/core:/stable:/v${K8S_MINOR}/deb/}"
 K8S_APT_KEY_FALLBACK="${K8S_APT_KEY_FALLBACK:-https://pkgs.k8s.io/core:/stable:/v${K8S_MINOR}/deb/Release.key}"
-IMAGE_REPOSITORY="${IMAGE_REPOSITORY:-registry.aliyuncs.com/google_containers}"
-PAUSE_IMAGE="${PAUSE_IMAGE:-registry.aliyuncs.com/google_containers/pause:3.10}"
+
+# IMAGE_MIRROR 留空则用官方 registry.k8s.io
+K8S_OFFICIAL_REGISTRY="registry.k8s.io"
+PAUSE_VERSION="${PAUSE_VERSION:-3.10}"
+if [[ -n "${_ENV_IMAGE_MIRROR}" ]]; then
+  IMAGE_MIRROR="${_ENV_IMAGE_MIRROR}"
+elif [[ -n "${_CONF_IMAGE_MIRROR}" ]]; then
+  IMAGE_MIRROR="${_CONF_IMAGE_MIRROR}"
+else
+  IMAGE_MIRROR=""
+fi
+IMAGE_MIRROR="${IMAGE_MIRROR%/}"
+
+if [[ -n "${_ENV_IMAGE_REPOSITORY}" ]]; then
+  IMAGE_REPOSITORY="${_ENV_IMAGE_REPOSITORY}"
+elif [[ -n "${IMAGE_MIRROR}" ]]; then
+  IMAGE_REPOSITORY="${IMAGE_MIRROR}/${K8S_OFFICIAL_REGISTRY}"
+else
+  IMAGE_REPOSITORY="${K8S_OFFICIAL_REGISTRY}"
+fi
+
+if [[ -n "${_ENV_PAUSE_IMAGE}" ]]; then
+  PAUSE_IMAGE="${_ENV_PAUSE_IMAGE}"
+elif [[ -n "${IMAGE_MIRROR}" ]]; then
+  PAUSE_IMAGE="${IMAGE_MIRROR}/${K8S_OFFICIAL_REGISTRY}/pause:${PAUSE_VERSION}"
+else
+  PAUSE_IMAGE="${K8S_OFFICIAL_REGISTRY}/pause:${PAUSE_VERSION}"
+fi
 DOCKER_MIRROR="${DOCKER_MIRROR:-https://docker.m.daocloud.io}"
 GH_PROXY="${GH_PROXY:-https://ghfast.top/}"
 FLANNEL_IMAGE_REPO="${FLANNEL_IMAGE_REPO:-docker.m.daocloud.io/flannel}"
@@ -291,22 +322,19 @@ server = "https://quay.io"
 EOF
 
   mkdir -p /etc/containerd/certs.d/registry.k8s.io
-  cat >/etc/containerd/certs.d/registry.k8s.io/hosts.toml <<'EOF'
+  if [[ -n "${IMAGE_MIRROR}" ]]; then
+    cat >/etc/containerd/certs.d/registry.k8s.io/hosts.toml <<EOF
 server = "https://registry.k8s.io"
 
-[host."https://registry.aliyuncs.com/google_containers"]
+[host."https://${IMAGE_MIRROR}/${K8S_OFFICIAL_REGISTRY}"]
   capabilities = ["pull", "resolve"]
   override_path = true
 EOF
-
-  mkdir -p /etc/containerd/certs.d/gcr.io
-  cat >/etc/containerd/certs.d/gcr.io/hosts.toml <<'EOF'
-server = "https://gcr.io"
-
-[host."https://registry.aliyuncs.com/google_containers"]
-  capabilities = ["pull", "resolve"]
-  override_path = true
+  else
+    cat >/etc/containerd/certs.d/registry.k8s.io/hosts.toml <<'EOF'
+server = "https://registry.k8s.io"
 EOF
+  fi
 
   if grep -q 'config_path' /etc/containerd/config.toml 2>/dev/null; then
     sed -i 's|config_path = ".*"|config_path = "/etc/containerd/certs.d"|' /etc/containerd/config.toml
@@ -326,8 +354,9 @@ print_mirror_summary() {
   echo
   log "Kubernetes 版本: v${K8S_MINOR}（来源: ${K8S_MINOR_SOURCE}${KUBE_VERSION:+, 包版本=${KUBE_VERSION}}）"
   log "版本限制: 仅 v${K8S_MINOR_MIN}-v${K8S_MINOR_MAX}（脚本写死）；conf 填 K8S_MINOR=，不填默认 ${K8S_MINOR_DEFAULT}"
-  log "当前国内镜像配置："
+  log "当前镜像配置："
   echo "  K8S apt      : ${K8S_APT_MIRROR}"
+  echo "  镜像前缀     : ${IMAGE_MIRROR:-（未设置，使用官方 ${K8S_OFFICIAL_REGISTRY}）}"
   echo "  控制面仓库   : ${IMAGE_REPOSITORY}"
   echo "  pause        : ${PAUSE_IMAGE}"
   echo "  Docker 加速  : ${DOCKER_MIRROR}"
@@ -771,22 +800,42 @@ EOF
   apt-mark hold kubelet kubeadm kubectl
   systemctl enable --now kubelet
 
-  log "6/7 预拉取 pause（国内仓库）"
-  if command -v ctr >/dev/null 2>&1; then
-    ctr -n k8s.io images pull "${PAUSE_IMAGE}" \
-      || warn "pause 拉取失败，请检查网络后手动: ctr -n k8s.io images pull ${PAUSE_IMAGE}"
-  fi
-
-  log "7/7 预拉取 kubeadm 控制面镜像（${IMAGE_REPOSITORY}）"
   local ver
   ver="$(kubeadm version -o short | sed 's/^v//')"
+
+  log "6/7 所需镜像"
+  local pause_img="${PAUSE_IMAGE}"
+  local -a pull_images=("${pause_img}")
+  local img
+  while IFS= read -r img; do
+    [[ -z "${img}" ]] && continue
+    [[ "${img}" == "${pause_img}" ]] && continue
+    pull_images+=("${img}")
+  done < <(
+    kubeadm config images list \
+      --kubernetes-version "v${ver}" \
+      --image-repository "${IMAGE_REPOSITORY}" \
+      2>/dev/null || true
+  )
+  echo "  仓库: ${IMAGE_REPOSITORY}  版本: v${ver}"
+  echo "  共 ${#pull_images[@]} 个："
+  for img in "${pull_images[@]}"; do
+    echo "    ${img}"
+  done
+  echo
+
+  log "7/7 预拉取镜像"
+  if command -v ctr >/dev/null 2>&1; then
+    ctr -n k8s.io images pull "${pause_img}" \
+      || warn "pause 拉取失败，请检查网络后手动: ctr -n k8s.io images pull ${pause_img}"
+  fi
   kubeadm config images pull \
     --kubernetes-version "v${ver}" \
     --image-repository "${IMAGE_REPOSITORY}" \
-    || warn "控制面镜像预拉取失败。请检查 IMAGE_REPOSITORY 后重试。"
+    || warn "控制面镜像预拉取失败，请检查 IMAGE_MIRROR"
 
   echo
-  log "节点环境已就绪（国内镜像）"
+  log "节点环境已就绪"
   echo "  kubeadm : $(kubeadm version -o short)"
   echo "  kubelet : $(kubelet --version 2>/dev/null | awk '{print $2}')"
   echo "  kubectl : $(kubectl version --client -o yaml 2>/dev/null | awk '/gitVersion:/ {print $2; exit}')"
