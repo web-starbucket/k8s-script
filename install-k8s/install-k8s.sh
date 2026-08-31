@@ -1408,11 +1408,12 @@ cmd_join_workers() {
   join_args="$(build_join_worker_args)"
   log "自动生成 join 参数: ${join_args}"
 
-  local ip host role user pass remote_dir remote_cmd n_ok=0 n_skip=0 n_fail=0
+  local ip host role user pass remote_dir remote_cmd n_ok=0 n_skip=0 n_fail=0 n_hit=0
   remote_dir="/opt/service/k8s"
   while IFS='|' read -r ip host role user pass; do
     [[ -n "${ip}" ]] || continue
     [[ -n "${only_ip}" && "${ip}" != "${only_ip}" ]] && continue
+    n_hit=$((n_hit + 1))
 
     log "======== worker ${user}@${ip} (${host}) ========"
     if node_in_cluster "${ip}" "${host}"; then
@@ -1481,6 +1482,8 @@ cmd_join_workers() {
     fi
     echo
   done < <(list_ssh_nodes | awk -F'|' 'tolower($3)=="worker"')
+
+  [[ "${n_hit}" -gt 0 ]] || err "节点表中没有匹配的 worker${only_ip:+: ${only_ip}}（角色须为 worker）"
 
   echo
   log "join-workers 结束：成功=${n_ok} 跳过=${n_skip} 失败=${n_fail}"

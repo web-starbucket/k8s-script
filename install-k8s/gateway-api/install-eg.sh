@@ -227,8 +227,9 @@ download_gh() {
 
 GH_PROXY="${GH_PROXY:-https://ghfast.top/}"
 [[ "${GH_PROXY}" == */ ]] || GH_PROXY="${GH_PROXY}/"
-# 可选：私有仓前缀，例如 registry.example.com/myproj（镜像名仍为 gateway/envoy/ratelimit，无 envoyproxy/ 前缀）
-IMAGE_REGISTRY="${IMAGE_REGISTRY:-}"
+IMAGE_REGISTRY="${IMAGE_REGISTRY:-registry.cn-global.starbucket.com.cn/starbucket}"
+# 私有仓完整路径 = ${IMAGE_REGISTRY}/${EG_IMAGE_SOURCE}/envoyproxy/<name>:<tag>
+EG_IMAGE_SOURCE="${EG_IMAGE_SOURCE:-docker.m.daocloud.io}"
 EG_VERSION="${EG_VERSION:-v1.8.2}"
 GATEWAY_API_VERSION="${GATEWAY_API_VERSION:-v1.5.1}"
 NS="envoy-gateway-system"
@@ -244,7 +245,7 @@ need curl
 need python3
 kv "GH_PROXY" "${GH_PROXY}"
 if [[ -n "${IMAGE_REGISTRY}" ]]; then
-  kv "镜像仓库" "${IMAGE_REGISTRY}"
+  kv "镜像仓库" "${IMAGE_REGISTRY%/}/${EG_IMAGE_SOURCE}/envoyproxy/..."
 else
   kv "镜像仓库" "官方 docker.io/envoyproxy（未设置 IMAGE_REGISTRY）"
 fi
@@ -300,17 +301,19 @@ step 4 6 "准备控制器镜像清单"
 INSTALL_YAML="${TMPDIR}/install-local.yaml"
 if [[ -n "${IMAGE_REGISTRY}" ]]; then
   REG="${IMAGE_REGISTRY%/}"
-  info "使用私有仓替换镜像: ${REG}"
-  sed \
-    -e "s|docker.io/envoyproxy/gateway:${EG_VERSION}|${REG}/gateway:${EG_VERSION}|g" \
-    -e "s|envoyproxy/gateway:${EG_VERSION}|${REG}/gateway:${EG_VERSION}|g" \
-    -e "s|docker.io/envoyproxy/ratelimit:1e50889b|${REG}/ratelimit:1e50889b|g" \
-    -e "s|envoyproxy/ratelimit:1e50889b|${REG}/ratelimit:1e50889b|g" \
-    -e "s|docker.io/envoyproxy/ratelimit:fe26676d|${REG}/ratelimit:fe26676d|g" \
-    -e "s|envoyproxy/ratelimit:fe26676d|${REG}/ratelimit:fe26676d|g" \
+  SRC="${EG_IMAGE_SOURCE%/}"
+  PREFIX="${REG}/${SRC}/envoyproxy"
+  info "使用私有仓拼接源路径: ${PREFIX}/..."
+  # 保留官方相对路径：.../docker.m.daocloud.io/envoyproxy/gateway:v1.8.2
+  sed -E \
+    -e "s#(image:[[:space:]]*)docker.io/envoyproxy/#\1${PREFIX}/#g" \
+    -e "s#(image:[[:space:]]*)docker.m.daocloud.io/envoyproxy/#\1${PREFIX}/#g" \
+    -e "s#(image:[[:space:]]*)envoyproxy/#\1${PREFIX}/#g" \
     "${TMPDIR}/install-no-gwapi.yaml" > "${INSTALL_YAML}"
-  # 数据面 EnvoyProxy 镜像同步替换
-  sed -e "s|docker.io/envoyproxy/envoy:distroless-v1.38.0|${REG}/envoy:distroless-v1.38.0|g" \
+  sed -E \
+    -e "s#(image:[[:space:]]*)docker.io/envoyproxy/#\1${PREFIX}/#g" \
+    -e "s#(image:[[:space:]]*)docker.m.daocloud.io/envoyproxy/#\1${PREFIX}/#g" \
+    -e "s#(image:[[:space:]]*)envoyproxy/#\1${PREFIX}/#g" \
     "${WORKDIR}/eg-proxy.yaml" > "${TMPDIR}/eg-proxy-local.yaml"
 else
   cp "${TMPDIR}/install-no-gwapi.yaml" "${INSTALL_YAML}"

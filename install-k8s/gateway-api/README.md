@@ -10,7 +10,9 @@
 | Envoy Proxy | distroless-v1.38.0 |
 | Rate Limit | 1e50889b |
 
-默认使用官方镜像 `docker.io/envoyproxy/...`。内网环境可设 `IMAGE_REGISTRY` / `PRIVATE_REGISTRY` 指向私有仓（镜像名为 `gateway` / `envoy` / `ratelimit`，不含 `envoyproxy/` 路径前缀）。
+默认使用官方镜像 `docker.io/envoyproxy/...`。设置 `IMAGE_REGISTRY` 后按源路径拼接，例如：
+
+`registry.cn-global.starbucket.com.cn/starbucket/docker.m.daocloud.io/envoyproxy/gateway:v1.8.2`
 
 ### 脚本一览
 
@@ -36,10 +38,9 @@ bash sync-images.sh
 同步后的镜像形如：
 
 ```text
-${PRIVATE_REGISTRY}/gateway:v1.8.2
-${PRIVATE_REGISTRY}/envoy:distroless-v1.38.0
-${PRIVATE_REGISTRY}/ratelimit:1e50889b
-${PRIVATE_REGISTRY}/ratelimit:fe26676d
+${IMAGE_REGISTRY}/docker.m.daocloud.io/envoyproxy/gateway:v1.8.2
+${IMAGE_REGISTRY}/docker.m.daocloud.io/envoyproxy/envoy:distroless-v1.38.0
+${IMAGE_REGISTRY}/docker.m.daocloud.io/envoyproxy/ratelimit:1e50889b
 ```
 
 ---
