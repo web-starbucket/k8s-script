@@ -172,9 +172,14 @@ GH_PROXY="${GH_PROXY:-https://ghfast.top/}"
 FLANNEL_IMAGE_REPO="${FLANNEL_IMAGE_REPO:-docker.m.daocloud.io/flannel}"
 
 CALICO_VERSION="${CALICO_VERSION:-v3.29.3}"
-CALICO_REGISTRY="${CALICO_REGISTRY:-docker.m.daocloud.io}"
 CALICO_IMAGE_PATH="${CALICO_IMAGE_PATH:-calico}"
-QUAY_MIRROR="${QUAY_MIRROR:-quay.m.daocloud.io}"
+if [[ -n "${IMAGE_MIRROR}" ]]; then
+  CALICO_REGISTRY="${IMAGE_MIRROR}/docker.io"
+  QUAY_MIRROR="${IMAGE_MIRROR}/quay.io"
+else
+  CALICO_REGISTRY="${CALICO_REGISTRY:-docker.io}"
+  QUAY_MIRROR="${QUAY_MIRROR:-quay.io}"
+fi
 
 VIP_IFACE="${VIP_IFACE:-}"
 VIP_ROUTER_ID="${VIP_ROUTER_ID:-51}"
@@ -276,6 +281,27 @@ need_root() {
   [[ $EUID -eq 0 ]] || err "请使用 root 执行：sudo bash $0 $*"
 }
 
+kubeadm_api_version() {
+  local api
+  api="$(kubeadm config print init-defaults 2>/dev/null | awk '/^apiVersion: kubeadm/{print $2; exit}')"
+  echo "${api:-kubeadm.k8s.io/v1beta3}"
+}
+
+# 自定义仓库时 kubeadm 会把 coredns/coredns 压成 coredns；IMAGE_MIRROR 需保留官方路径
+write_kubeadm_cluster_images_cfg() {
+  local dest="$1" ver="$2"
+  {
+    echo "apiVersion: $(kubeadm_api_version)"
+    echo "kind: ClusterConfiguration"
+    echo "kubernetesVersion: v${ver}"
+    echo "imageRepository: ${IMAGE_REPOSITORY}"
+    if [[ -n "${IMAGE_MIRROR}" ]]; then
+      echo "dns:"
+      echo "  imageRepository: ${IMAGE_REPOSITORY}/coredns"
+    fi
+  } >"${dest}"
+}
+
 check_os() {
   if [[ -f /etc/os-release ]]; then
     # shellcheck source=/dev/null
@@ -297,6 +323,22 @@ gh_url() {
     fi
   else
     echo "${url}"
+  fi
+}
+
+# 仅改 image: 行，避免把已带前缀的 .../docker.io/ 再替换一次
+rewrite_calico_yaml_images() {
+  local f="$1"
+  if [[ -n "${IMAGE_MIRROR}" ]]; then
+    sed -i -E \
+      -e "s#(image:[[:space:]]*\"?)docker.io/#\1${IMAGE_MIRROR}/docker.io/#g" \
+      -e "s#(image:[[:space:]]*\"?)quay.io/#\1${IMAGE_MIRROR}/quay.io/#g" \
+      "${f}"
+  elif [[ "${CALICO_REGISTRY}" != "docker.io" || "${QUAY_MIRROR}" != "quay.io" ]]; then
+    sed -i \
+      -e "s|quay.io/|${QUAY_MIRROR}/|g" \
+      -e "s|docker.io/|${CALICO_REGISTRY}/|g" \
+      "${f}"
   fi
 }
 
@@ -359,6 +401,8 @@ print_mirror_summary() {
   echo "  镜像前缀     : ${IMAGE_MIRROR:-（未设置，使用官方 ${K8S_OFFICIAL_REGISTRY}）}"
   echo "  控制面仓库   : ${IMAGE_REPOSITORY}"
   echo "  pause        : ${PAUSE_IMAGE}"
+  echo "  Calico       : ${CALICO_REGISTRY}/${CALICO_IMAGE_PATH}/..."
+  echo "  operator     : ${QUAY_MIRROR}/tigera/operator"
   echo "  Docker 加速  : ${DOCKER_MIRROR}"
   echo "  GitHub 代理  : ${GH_PROXY:-（直连）}"
   echo
@@ -702,6 +746,10 @@ EOS
 }
 
 cmd_prepare() {
+  if [[ $# -gt 0 ]]; then
+    cmd_prepare_all "$@"
+    return
+  fi
   need_root prepare
   check_os
   print_mirror_summary
@@ -805,18 +853,16 @@ EOF
 
   log "6/7 所需镜像"
   local pause_img="${PAUSE_IMAGE}"
+  local img_cfg
+  img_cfg="$(mktemp)"
+  write_kubeadm_cluster_images_cfg "${img_cfg}" "${ver}"
   local -a pull_images=("${pause_img}")
   local img
   while IFS= read -r img; do
     [[ -z "${img}" ]] && continue
     [[ "${img}" == "${pause_img}" ]] && continue
     pull_images+=("${img}")
-  done < <(
-    kubeadm config images list \
-      --kubernetes-version "v${ver}" \
-      --image-repository "${IMAGE_REPOSITORY}" \
-      2>/dev/null || true
-  )
+  done < <(kubeadm config images list --config "${img_cfg}" 2>/dev/null || true)
   echo "  仓库: ${IMAGE_REPOSITORY}  版本: v${ver}"
   echo "  共 ${#pull_images[@]} 个："
   for img in "${pull_images[@]}"; do
@@ -829,10 +875,9 @@ EOF
     ctr -n k8s.io images pull "${pause_img}" \
       || warn "pause 拉取失败，请检查网络后手动: ctr -n k8s.io images pull ${pause_img}"
   fi
-  kubeadm config images pull \
-    --kubernetes-version "v${ver}" \
-    --image-repository "${IMAGE_REPOSITORY}" \
+  kubeadm config images pull --config "${img_cfg}" \
     || warn "控制面镜像预拉取失败，请检查 IMAGE_MIRROR"
+  rm -f "${img_cfg}"
 
   echo
   log "节点环境已就绪"
@@ -843,6 +888,75 @@ EOF
   echo "下一步："
   echo "  首节点: sudo bash $0 init --apiserver-advertise-address=<本机IP>"
   echo "  其它节点: sudo bash $0 join <MASTER_IP>:6443 --token ... --discovery-token-ca-cert-hash sha256:..."
+}
+
+cmd_prepare_all() {
+  need_root prepare-all
+  local dry=0 only_ip=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry=1; shift ;;
+      --only=*)  only_ip="${1#*=}"; shift ;;
+      *) err "用法: $0 prepare-all [--only=IP] [--dry-run]" ;;
+    esac
+  done
+
+  [[ -f "${K8S_NODES_FILE}" ]] || err "需要 ${K8S_NODES_FILE}"
+  [[ -f "${SCRIPT_DIR}/install-k8s.sh" ]] || err "找不到安装脚本"
+  ensure_sshpass
+
+  local ip host role user pass remote_dir n_ok=0 n_fail=0 n_skip=0 n_hit=0
+  remote_dir="/opt/service/k8s"
+  log "远程 prepare${only_ip:+（仅 ${only_ip}）}"
+  echo
+
+  while IFS='|' read -r ip host role user pass; do
+    [[ -n "${ip}" ]] || continue
+    [[ -n "${only_ip}" && "${ip}" != "${only_ip}" ]] && continue
+    n_hit=$((n_hit + 1))
+
+    log "======== ${user}@${ip} (${host}) [${role}] ========"
+    if [[ "${dry}" == "1" ]]; then
+      echo "  DRY-RUN: prepare"
+      continue
+    fi
+
+    if is_local_ip "${ip}"; then
+      if bash "${SCRIPT_DIR}/install-k8s.sh" prepare; then
+        log "OK 本机 prepare"
+        n_ok=$((n_ok + 1))
+      else
+        warn "FAIL 本机 prepare"
+        n_fail=$((n_fail + 1))
+      fi
+      continue
+    fi
+
+    if [[ -z "${pass}" ]] && ! ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=5 "${user}@${ip}" "true" 2>/dev/null; then
+      warn "跳过 ${ip}：无密码且无法免密 SSH（请先 ssh-keys）"
+      n_skip=$((n_skip + 1))
+      continue
+    fi
+
+    sync_install_to_node "${user}" "${ip}" "${pass}" "${remote_dir}" || {
+      warn "同步脚本/conf 失败 ${ip}"
+      n_fail=$((n_fail + 1))
+      continue
+    }
+
+    if remote_ssh "${user}" "${ip}" "${pass}" "cd ${remote_dir} && bash install-k8s.sh prepare"; then
+      log "OK ${host} (${ip})"
+      n_ok=$((n_ok + 1))
+    else
+      warn "FAIL ${host} (${ip})"
+      n_fail=$((n_fail + 1))
+    fi
+    echo
+  done < <(list_ssh_nodes)
+
+  [[ "${n_hit}" -gt 0 ]] || err "节点表中没有匹配的 master/worker${only_ip:+: ${only_ip}}"
+  echo
+  log "prepare-all 结束：成功=${n_ok} 跳过=${n_skip} 失败=${n_fail}"
 }
 
 cmd_init() {
@@ -859,22 +973,53 @@ cmd_init() {
 
   [[ -n "${advertise}" ]] || err "必须指定 --apiserver-advertise-address=<IP>"
 
-  local args=(
-    init
-    --kubernetes-version "v$(kubeadm version -o short | sed 's/^v//')"
-    --apiserver-advertise-address "${advertise}"
-    --pod-network-cidr "${POD_CIDR}"
-    --service-cidr "${SERVICE_CIDR}"
-    --cri-socket unix:///run/containerd/containerd.sock
-    --image-repository "${IMAGE_REPOSITORY}"
-    --upload-certs
-  )
-  [[ -n "${endpoint}" ]] && args+=(--control-plane-endpoint "${endpoint}")
+  local ver
+  ver="$(kubeadm version -o short | sed 's/^v//')"
+  local args=(init --upload-certs)
+  local init_cfg=""
+  if [[ -n "${IMAGE_MIRROR}" ]]; then
+    init_cfg="$(mktemp)"
+    local api dns_block="" cp_block=""
+    api="$(kubeadm_api_version)"
+    [[ -n "${endpoint}" ]] && cp_block="controlPlaneEndpoint: ${endpoint}"
+    dns_block=$'dns:\n  imageRepository: '"${IMAGE_REPOSITORY}/coredns"
+    cat >"${init_cfg}" <<EOF
+apiVersion: ${api}
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: ${advertise}
+  bindPort: 6443
+nodeRegistration:
+  criSocket: unix:///run/containerd/containerd.sock
+---
+apiVersion: ${api}
+kind: ClusterConfiguration
+kubernetesVersion: v${ver}
+imageRepository: ${IMAGE_REPOSITORY}
+${cp_block}
+networking:
+  podSubnet: ${POD_CIDR}
+  serviceSubnet: ${SERVICE_CIDR}
+${dns_block}
+EOF
+    args+=(--config "${init_cfg}")
+  else
+    args+=(
+      --kubernetes-version "v${ver}"
+      --apiserver-advertise-address "${advertise}"
+      --pod-network-cidr "${POD_CIDR}"
+      --service-cidr "${SERVICE_CIDR}"
+      --cri-socket unix:///run/containerd/containerd.sock
+      --image-repository "${IMAGE_REPOSITORY}"
+    )
+    [[ -n "${endpoint}" ]] && args+=(--control-plane-endpoint "${endpoint}")
+  fi
   [[ ${#extra[@]} -gt 0 ]] && args+=("${extra[@]}")
 
   log "控制面镜像仓库: ${IMAGE_REPOSITORY}"
   log "执行: kubeadm ${args[*]}"
   kubeadm "${args[@]}"
+  [[ -n "${init_cfg}" ]] && rm -f "${init_cfg}"
 
   mkdir -p /root/.kube
   cp -f /etc/kubernetes/admin.conf /root/.kube/config
@@ -889,10 +1034,17 @@ cmd_init() {
   fi
 
   echo
+  if [[ -n "${endpoint}" ]] && ! curl -sk --connect-timeout 3 "https://${endpoint}/healthz" >/dev/null 2>&1; then
+    warn "API 入口 ${endpoint} 不可达。kubeconfig 指向 VIP，需先有 Keepalived + HAProxy。"
+    echo "  请执行: sudo bash $0 vip-all"
+    echo "  临时（本机 apiserver）:"
+    echo "    kubectl --server=https://${advertise}:6443 --kubeconfig /etc/kubernetes/admin.conf get nodes"
+    echo
+  fi
   log "控制面初始化完成。实验架构建议下一步："
-  echo "  1) 安装 CNI: sudo bash $0 cni-calico"
-  echo "  2) 其余节点: sudo bash $0 join-masters / join-workers / join-all"
-  echo "  详见 K8s-1.33搭建指南.md"
+  echo "  1) 若用 VIP：sudo bash $0 vip-all   （init 前或现在补配均可）"
+  echo "  2) 安装 CNI: sudo bash $0 cni-calico"
+  echo "  3) 其余节点: sudo bash $0 join-masters / join-workers / join-all"
 }
 
 cmd_vip() {
@@ -919,11 +1071,12 @@ cmd_vip() {
     log "自动检测到网卡: ${iface}"
   fi
 
-  log "1/4 开启 ip_nonlocal_bind（允许未持有 VIP 时也可 bind VIP 端口）"
+  log "1/4 开启 ip_nonlocal_bind（允许未持有 VIP 时也可 bind）"
   cat >/etc/sysctl.d/99-vip-nonlocal.conf <<'EOF'
 net.ipv4.ip_nonlocal_bind = 1
 EOF
-  sysctl --system >/dev/null
+  sysctl -w net.ipv4.ip_nonlocal_bind=1 >/dev/null
+  sysctl --system >/dev/null 2>&1 || true
 
   log "2/4 安装 haproxy + keepalived"
   apt-get update -y
@@ -938,13 +1091,12 @@ EOF
     backend_cfg+="    server m-${p//./-} ${p}:6443 check inter 3s fall 3 rise 2"$'\n'
   done
 
-  log "3/4 写入 HAProxy（前端 ${vip}:${lb_port} → 后端 Masters:6443）"
+  log "3/4 写入 HAProxy（*:${lb_port} → Masters:6443；勿写 daemon，Ubuntu 用 systemd -Ws）"
   cat >/etc/haproxy/haproxy.cfg <<EOF
 global
     log /dev/log local0
     log /dev/log local1 notice
     maxconn 4000
-    daemon
     user haproxy
     group haproxy
 
@@ -961,7 +1113,7 @@ defaults
     retries 3
 
 frontend k8s-api-front
-    bind ${vip}:${lb_port}
+    bind *:${lb_port}
     mode tcp
     option tcplog
     default_backend k8s-api-back
@@ -973,6 +1125,10 @@ backend k8s-api-back
     default-server inter 5s fall 5 rise 2
 ${backend_cfg}
 EOF
+
+  if ! haproxy -c -f /etc/haproxy/haproxy.cfg; then
+    err "HAProxy 配置无效，请检查 /etc/haproxy/haproxy.cfg"
+  fi
 
   mkdir -p /etc/keepalived
   cat >/etc/keepalived/check_haproxy.sh <<'EOF'
@@ -1013,7 +1169,12 @@ vrrp_instance VI_K8S {
 EOF
 
   systemctl enable haproxy keepalived
-  systemctl restart haproxy || true
+  systemctl reset-failed haproxy 2>/dev/null || true
+  if ! systemctl restart haproxy; then
+    warn "HAProxy 启动失败："
+    journalctl -u haproxy -n 30 --no-pager || true
+    err "请检查: haproxy -c -f /etc/haproxy/haproxy.cfg ；ss -lntp | grep ${lb_port}"
+  fi
   sleep 1
   if ! systemctl restart keepalived; then
     warn "keepalived 启动失败，打印最近日志："
@@ -1041,6 +1202,14 @@ EOF
   warn "单机 vip 完成。多 Master 请用: sudo bash $0 vip-all   （管理机一键部署全部 Master）"
 }
 
+# 远程 SSH 公共参数：不写 known_hosts，压掉 Permanently added 提示
+SSH_OPTS=(
+  -o StrictHostKeyChecking=no
+  -o UserKnownHostsFile=/dev/null
+  -o LogLevel=ERROR
+  -o ServerAliveInterval=30
+)
+
 remote_ssh() {
   local user="$1" ip="$2" pass="$3" cmd="$4"
   if is_local_ip "${ip}"; then
@@ -1048,12 +1217,12 @@ remote_ssh() {
     return $?
   fi
   # while-read 中 SSH 须 -n / </dev/null，否则只处理第一台
-  if ssh -n -o BatchMode=yes -o ConnectTimeout=8 "${user}@${ip}" "true" 2>/dev/null; then
-    ssh -n -o BatchMode=yes -o ConnectTimeout=30 "${user}@${ip}" "${cmd}"
+  if ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "${user}@${ip}" "true" 2>/dev/null; then
+    ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=30 "${user}@${ip}" "${cmd}"
     return $?
   fi
   [[ -n "${pass}" ]] || return 1
-  SSHPASS="${pass}" sshpass -e ssh -n -o StrictHostKeyChecking=no -o ConnectTimeout=30 "${user}@${ip}" "${cmd}"
+  SSHPASS="${pass}" sshpass -e ssh -n "${SSH_OPTS[@]}" -o ConnectTimeout=30 "${user}@${ip}" "${cmd}"
 }
 
 remote_scp() {
@@ -1063,12 +1232,12 @@ remote_scp() {
     cp -f "${src}" "${dst}"
     return $?
   fi
-  if ssh -n -o BatchMode=yes -o ConnectTimeout=8 "${user}@${ip}" "true" 2>/dev/null; then
-    scp -o BatchMode=yes -o ConnectTimeout=30 "${src}" "${user}@${ip}:${dst}" </dev/null
+  if ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "${user}@${ip}" "true" 2>/dev/null; then
+    scp "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=30 "${src}" "${user}@${ip}:${dst}" </dev/null
     return $?
   fi
   [[ -n "${pass}" ]] || return 1
-  SSHPASS="${pass}" sshpass -e scp -o StrictHostKeyChecking=no -o ConnectTimeout=30 "${src}" "${user}@${ip}:${dst}" </dev/null
+  SSHPASS="${pass}" sshpass -e scp "${SSH_OPTS[@]}" -o ConnectTimeout=30 "${src}" "${user}@${ip}:${dst}" </dev/null
 }
 
 cmd_vip_all() {
@@ -1484,16 +1653,12 @@ cmd_cni_calico() {
   op_tmp="$(mktemp)"
   cr_tmp="$(mktemp)"
 
-  log "安装 Calico ${CALICO_VERSION}（国内可用源：DaoCloud；阿里云公共仓无完整 Calico）"
-  log "  yaml 代理 : ${GH_PROXY:-直连}"
+  log "安装 Calico ${CALICO_VERSION}"
   log "  operator  : ${QUAY_MIRROR}/tigera/operator"
-  log "  组件仓库  : ${CALICO_REGISTRY}/${CALICO_IMAGE_PATH}/..."
+  log "  组件      : ${CALICO_REGISTRY}/${CALICO_IMAGE_PATH}/...（如 kube-controllers:${CALICO_VERSION}）"
 
   curl -fsSL "$(gh_url "${op_raw}")" -o "${op_tmp}" || err "下载 tigera-operator.yaml 失败"
-  sed -i \
-    -e "s|quay.io/|${QUAY_MIRROR}/|g" \
-    -e "s|docker.io/|${CALICO_REGISTRY}/|g" \
-    "${op_tmp}"
+  rewrite_calico_yaml_images "${op_tmp}"
 
   # 大 CRD 须 server-side apply（客户端 apply 注解会超 256KB）
   if ! kubectl apply --server-side --force-conflicts -f "${op_tmp}"; then
@@ -1526,7 +1691,6 @@ cmd_cni_calico() {
   kubectl apply -f "${cr_tmp}"
   rm -f "${op_tmp}" "${cr_tmp}"
 
-  log "确保 Installation 指向国内可用源（并清掉无效的阿里云公共路径）"
   kubectl patch installation.operator.tigera.io default --type=merge \
     -p "{\"spec\":{\"registry\":\"${CALICO_REGISTRY}\",\"imagePath\":\"${CALICO_IMAGE_PATH}\"}}" 2>/dev/null || true
 
@@ -1534,52 +1698,34 @@ cmd_cni_calico() {
     local dep
     dep="$(mktemp)"
     kubectl -n tigera-operator get deploy tigera-operator -o yaml >"${dep}"
-    sed -i \
-      -e "s|quay.io/|${QUAY_MIRROR}/|g" \
-      -e "s|docker.io/|${CALICO_REGISTRY}/|g" \
-      -e "s|registry.cn-hangzhou.aliyuncs.com/tigera/|${QUAY_MIRROR}/tigera/|g" \
-      -e "s|registry.cn-hangzhou.aliyuncs.com/calico/|${CALICO_REGISTRY}/calico/|g" \
-      -e "s|registry.aliyuncs.com/tigera/|${QUAY_MIRROR}/tigera/|g" \
-      "${dep}"
+    rewrite_calico_yaml_images "${dep}"
     kubectl apply -f "${dep}" >/dev/null
     rm -f "${dep}"
   fi
 
-  log "重启异常 Pod，强制用新镜像拉取"
   kubectl -n calico-system delete pods --all --force --grace-period=0 2>/dev/null || true
   kubectl -n tigera-operator delete pods --field-selector=status.phase!=Running --force --grace-period=0 2>/dev/null || true
 
-  log "等待 tigera-operator / calico-system（拉镜像可能需几分钟）..."
+  log "等待 tigera-operator / calico-system..."
   kubectl -n tigera-operator rollout status deploy/tigera-operator --timeout=180s 2>/dev/null || true
   echo
   kubectl get pods -n tigera-operator -o wide 2>/dev/null || true
   kubectl get pods -n calico-system -o wide 2>/dev/null || true
-  echo
-  log "核对镜像应含 ${CALICO_REGISTRY} 或 ${QUAY_MIRROR}："
-  echo "  kubectl get installation.operator.tigera.io default -o yaml | grep -E 'registry:|imagePath:'"
-  echo "  kubectl -n calico-system describe pod <失败pod> | grep -A5 'Failed'"
-  warn "若要用自有阿里云 ACR：先同步镜像，再 export CALICO_REGISTRY=你的ACR QUAY_MIRROR=你的ACR"
 }
 
 cmd_cni_calico_mirror() {
   need_root cni-calico-mirror
   export KUBECONFIG=/etc/kubernetes/admin.conf
-  log "将 Installation 切到国内可用源: ${CALICO_REGISTRY}/${CALICO_IMAGE_PATH}"
+  log "Installation registry: ${CALICO_REGISTRY}/${CALICO_IMAGE_PATH}"
   kubectl patch installation.operator.tigera.io default --type=merge \
     -p "{\"spec\":{\"registry\":\"${CALICO_REGISTRY}\",\"imagePath\":\"${CALICO_IMAGE_PATH}\"}}" \
     || err "patch Installation 失败（确认已装 Calico operator）"
 
-  log "将 tigera-operator Deployment 镜像改为 ${QUAY_MIRROR}"
+  log "tigera-operator 镜像: ${QUAY_MIRROR}/tigera/operator"
   local tmp
   tmp="$(mktemp)"
   kubectl -n tigera-operator get deploy tigera-operator -o yaml >"${tmp}"
-  sed -i \
-    -e "s|quay.io/|${QUAY_MIRROR}/|g" \
-    -e "s|docker.io/|${CALICO_REGISTRY}/|g" \
-    -e "s|registry.cn-hangzhou.aliyuncs.com/tigera/|${QUAY_MIRROR}/tigera/|g" \
-    -e "s|registry.cn-hangzhou.aliyuncs.com/calico/|${CALICO_REGISTRY}/calico/|g" \
-    -e "s|registry.aliyuncs.com/tigera/|${QUAY_MIRROR}/tigera/|g" \
-    "${tmp}"
+  rewrite_calico_yaml_images "${tmp}"
   kubectl apply -f "${tmp}"
   rm -f "${tmp}"
 
@@ -1588,6 +1734,135 @@ cmd_cni_calico_mirror() {
   sleep 3
   kubectl get pods -n tigera-operator -o wide
   kubectl get pods -n calico-system -o wide
+}
+
+cni_clean_host() {
+  rm -f /etc/cni/net.d/10-calico*.conflist \
+    /etc/cni/net.d/*calico* \
+    /etc/cni/net.d/10-flannel* \
+    2>/dev/null || true
+  rm -rf /var/lib/calico /var/run/calico 2>/dev/null || true
+  local dev
+  for dev in cni0 flannel.1 tunl0 vxlan.calico; do
+    ip link delete "${dev}" 2>/dev/null || true
+  done
+  ip -o link show 2>/dev/null | awk -F': ' '$2 ~ /^cali/ {print $2}' | cut -d@ -f1 | while read -r d; do
+    [[ -n "${d}" ]] || continue
+    ip link delete "${d}" 2>/dev/null || true
+  done
+}
+
+cni_force_delete_ns() {
+  local ns="$1"
+  kubectl get ns "${ns}" >/dev/null 2>&1 || return 0
+  kubectl delete ns "${ns}" --ignore-not-found --timeout=60s 2>/dev/null && return 0
+  kubectl get ns "${ns}" >/dev/null 2>&1 || return 0
+  warn "命名空间 ${ns} 未结束，去掉 finalizers"
+  kubectl patch ns "${ns}" --type json -p '[{"op":"remove","path":"/spec/finalizers"}]' 2>/dev/null || true
+  kubectl patch ns "${ns}" --type json -p '[{"op":"remove","path":"/metadata/finalizers"}]' 2>/dev/null || true
+}
+
+cni_remove_calico() {
+  log "卸载 Calico"
+  kubectl patch installation.operator.tigera.io default --type json \
+    -p '[{"op":"remove","path":"/metadata/finalizers"}]' 2>/dev/null || true
+  kubectl delete installation.operator.tigera.io --all --ignore-not-found --timeout=60s 2>/dev/null || true
+  kubectl delete apiserver.operator.tigera.io --all --ignore-not-found --timeout=30s 2>/dev/null || true
+  kubectl delete tigerastatus --all --ignore-not-found --timeout=30s 2>/dev/null || true
+  kubectl -n calico-system delete ds,deploy,sts --all --ignore-not-found --timeout=30s 2>/dev/null || true
+  kubectl -n tigera-operator delete deploy --all --ignore-not-found --timeout=30s 2>/dev/null || true
+  local ns
+  for ns in calico-system calico-apiserver tigera-operator calico-monitoring; do
+    cni_force_delete_ns "${ns}"
+  done
+  kubectl -n kube-system delete ds calico-node deploy calico-kube-controllers --ignore-not-found 2>/dev/null || true
+  local crd
+  while IFS= read -r crd; do
+    [[ -z "${crd}" ]] && continue
+    kubectl patch "${crd}" --type json -p '[{"op":"remove","path":"/metadata/finalizers"}]' 2>/dev/null || true
+    kubectl delete "${crd}" --ignore-not-found --timeout=20s 2>/dev/null || true
+  done < <(kubectl get crd -o name 2>/dev/null | grep -E 'projectcalico\.org|tigera\.io' || true)
+}
+
+cni_remove_flannel() {
+  log "卸载 Flannel"
+  kubectl delete ns kube-flannel --ignore-not-found --timeout=60s 2>/dev/null || true
+  cni_force_delete_ns kube-flannel
+  kubectl -n kube-system delete ds kube-flannel-ds --ignore-not-found 2>/dev/null || true
+  kubectl delete clusterrole,clusterrolebinding flannel --ignore-not-found 2>/dev/null || true
+  kubectl delete sa -n kube-system flannel --ignore-not-found 2>/dev/null || true
+  kubectl delete cm -n kube-system kube-flannel-cfg --ignore-not-found 2>/dev/null || true
+}
+
+cmd_cni_remove() {
+  need_root cni-remove
+  export KUBECONFIG="${KUBECONFIG:-/etc/kubernetes/admin.conf}"
+  [[ -f "${KUBECONFIG}" ]] || err "未找到 ${KUBECONFIG}，请在控制面执行"
+
+  local do_calico=0 do_flannel=0 all_nodes=0 skip_wait=0
+  if [[ $# -eq 0 ]]; then
+    do_calico=1
+    do_flannel=1
+  fi
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --calico) do_calico=1; shift ;;
+      --flannel) do_flannel=1; shift ;;
+      --all-nodes) all_nodes=1; shift ;;
+      --yes|-y) skip_wait=1; shift ;;
+      *) err "用法: $0 cni-remove [--calico] [--flannel] [--all-nodes] [--yes]" ;;
+    esac
+  done
+  if [[ "${do_calico}" != "1" && "${do_flannel}" != "1" ]]; then
+    do_calico=1
+    do_flannel=1
+  fi
+
+  if [[ "${skip_wait}" != "1" ]]; then
+    warn "将卸载网络插件，节点会暂时无法通信，3 秒后继续... Ctrl+C 取消"
+    sleep 3
+  fi
+
+  if [[ "${do_calico}" == "1" ]]; then
+    if kubectl get ns tigera-operator >/dev/null 2>&1 \
+      || kubectl get ns calico-system >/dev/null 2>&1 \
+      || kubectl get installation.operator.tigera.io >/dev/null 2>&1; then
+      cni_remove_calico
+    else
+      log "未检测到 Calico 资源"
+    fi
+  fi
+  if [[ "${do_flannel}" == "1" ]]; then
+    if kubectl get ns kube-flannel >/dev/null 2>&1 \
+      || kubectl -n kube-system get ds kube-flannel-ds >/dev/null 2>&1; then
+      cni_remove_flannel
+    else
+      log "未检测到 Flannel 资源"
+    fi
+  fi
+
+  log "清理本机 CNI 残留"
+  cni_clean_host
+
+  if [[ "${all_nodes}" == "1" ]]; then
+    log "清理其它节点 CNI 残留"
+    local ip host role user pass remote
+    remote='rm -f /etc/cni/net.d/10-calico*.conflist /etc/cni/net.d/*calico* /etc/cni/net.d/10-flannel* 2>/dev/null; rm -rf /var/lib/calico /var/run/calico; ip link delete cni0 2>/dev/null; ip link delete flannel.1 2>/dev/null; ip link delete tunl0 2>/dev/null; ip link delete vxlan.calico 2>/dev/null; true'
+    while IFS='|' read -r ip host role user pass; do
+      [[ -n "${ip}" ]] || continue
+      is_local_ip "${ip}" && continue
+      if remote_ssh "${user}" "${ip}" "${pass}" "${remote}"; then
+        log "  ${host} (${ip}) 已清理"
+      else
+        warn "  ${host} (${ip}) 清理失败，请手动删 /etc/cni/net.d 中 calico/flannel 配置"
+      fi
+    done < <(list_ssh_nodes)
+  fi
+
+  echo
+  log "网络插件已卸载。重新安装: sudo bash $0 cni-calico 或 cni-flannel"
+  kubectl get nodes -o wide 2>/dev/null || true
+  kubectl get pods -A 2>/dev/null || true
 }
 
 cmd_status() {
@@ -1629,9 +1904,15 @@ do_node_cleanup() {
 
   log "清理 kubelet / CNI / etcd 残留"
   systemctl stop kubelet 2>/dev/null || true
-  # 停掉静态 Pod 相关容器，避免占用端口/文件
-  crictl stopp $(crictl pods -q) 2>/dev/null || true
-  crictl rmp $(crictl pods -q) 2>/dev/null || true
+  if command -v crictl >/dev/null 2>&1; then
+    local pods
+    pods="$(crictl pods -q 2>/dev/null || true)"
+    if [[ -n "${pods}" ]]; then
+      # shellcheck disable=SC2086
+      crictl stopp ${pods} 2>/dev/null || true
+      crictl rmp ${pods} 2>/dev/null || true
+    fi
+  fi
 
   rm -rf \
     /etc/cni/net.d \
@@ -1794,6 +2075,7 @@ usage() {
     查看 / 准备
       nodes          查看版本与节点表
       prepare        单机环境准备（每台都要）
+      prepare-all    远程 prepare，可 --only=IP
       hosts          刷新本机 hosts
       hosts-all      远程刷新全部节点 hosts
       ssh-keys       按 conf 分发 SSH 免密
@@ -1804,6 +2086,7 @@ usage() {
       init           仅 Master-1：kubeadm init
       cni-calico     安装 Calico（推荐）
       cni-flannel    安装 Flannel（勿与 Calico 同装）
+      cni-remove     卸载网络插件
 
     扩容
       join-all       一键加 Master + Worker（推荐）
@@ -1848,7 +2131,21 @@ EOF
   ────────────────────────────────
   作用  单机准备：关 swap、装 containerd/kubeadm、写 hosts、预拉镜像
   用法  sudo bash ${bin} prepare
-  说明  每台 master / worker 都要执行
+  说明  每台 master / worker 都要执行；指定节点见 prepare-all
+
+EOF
+      ;;
+    prepare-all)
+      cat <<EOF
+
+  命令  prepare-all
+  ────────────────────────────────
+  作用  按 conf 远程 prepare（同步脚本后在目标机执行）
+  用法  sudo bash ${bin} prepare-all [--only=IP] [--dry-run]
+        sudo bash ${bin} prepare --only=IP
+  参数  --only=<IP>   只准备一台
+        --dry-run     只预览
+  前提  建议先 ssh-keys
 
 EOF
       ;;
@@ -1939,11 +2236,25 @@ EOF
 
   命令  ${c}
   ────────────────────────────────
-  作用  cni-calico         安装 Calico（推荐，国内镜像）
+  作用  cni-calico         安装 Calico（推荐）
         cni-flannel        安装 Flannel（勿与 Calico 同装）
-        cni-calico-mirror  已装 Calico 时切换国内 registry
+        cni-calico-mirror  已装 Calico 时切换镜像仓库
   用法  sudo bash ${bin} ${c}
   时机  建议在 join 其它节点之前
+
+EOF
+      ;;
+    cni-remove)
+      cat <<EOF
+
+  命令  cni-remove
+  ────────────────────────────────
+  作用  卸载 Calico / Flannel（集群资源 + 本机 CNI 残留）
+  用法  sudo bash ${bin} cni-remove [--calico] [--flannel] [--all-nodes] [--yes]
+  参数  不指定 --calico/--flannel 时两者都卸（检测到才删）
+        --all-nodes   按 conf SSH 清理其它节点 /etc/cni/net.d
+        --yes         跳过等待
+  时机  换 CNI 前执行；完成后重新 cni-calico 或 cni-flannel
 
 EOF
       ;;
@@ -2058,6 +2369,7 @@ main() {
   shift || true
   case "${cmd}" in
     prepare)     cmd_prepare "$@" ;;
+    prepare-all) cmd_prepare_all "$@" ;;
     hosts)       cmd_hosts "$@" ;;
     hosts-all)   cmd_hosts_all "$@" ;;
     nodes)       cmd_nodes "$@" ;;
@@ -2072,6 +2384,7 @@ main() {
     cni-flannel)  cmd_cni_flannel "$@" ;;
     cni-calico)  cmd_cni_calico "$@" ;;
     cni-calico-mirror) cmd_cni_calico_mirror "$@" ;;
+    cni-remove)  cmd_cni_remove "$@" ;;
     status)      cmd_status "$@" ;;
     reset)       cmd_reset "$@" ;;
     reset-all)   cmd_reset_all "$@" ;;
