@@ -440,13 +440,14 @@ curl -sI -H "X-Request-ID: ${RID}" http://172.16.10.114:31258/ | grep -i x-reque
 # EnvoyGateway / ConfigMap 配置片段
 extensionApis:
   enableEnvoyPatchPolicy: true
+  enableBackend: true   # HTTPRoute 用 Backend(FQDN) 时需要；空端点仍可用 BTP 自定义 503
 ```
 
 常见改法（按实际安装调整）：
 
 ```bash
 kubectl -n envoy-gateway-system edit configmap envoy-gateway-config
-# 在 envoy-gateway.yaml 的 extensionApis 下加上 enableEnvoyPatchPolicy: true
+# 在 envoy-gateway.yaml 的 extensionApis 下加上 enableEnvoyPatchPolicy / enableBackend
 kubectl -n envoy-gateway-system rollout restart deploy/envoy-gateway
 ```
 

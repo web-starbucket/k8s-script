@@ -1,0 +1,82 @@
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: upstream-error
+  namespace: default
+  resourceVersion: '337059'
+spec:
+  responseOverride:
+    - match:
+        statusCodes:
+          - type: Value
+            value: 500
+          - type: Value
+            value: 502
+          - type: Value
+            value: 503
+      response:
+        body:
+          inline: |
+            <!DOCTYPE html>
+            <html lang="zh-CN">
+            <head>
+              <meta charset="utf-8"/>
+              <meta name="viewport" content="width=device-width, initial-scale=1"/>
+              <title>服务不可用</title>
+              <style>
+                :root { color-scheme: light; }
+                * { box-sizing: border-box; }
+                body {
+                  margin: 0; min-height: 100vh;
+                  display: grid; place-items: center;
+                  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+                  background: #f4f6f8;
+                  color: #1a1d21;
+                }
+                .card {
+                  width: min(92vw, 420px);
+                  padding: 40px 32px;
+                  background: #fff;
+                  border: 1px solid #e6e9ee;
+                  border-radius: 16px;
+                  box-shadow: 0 10px 30px rgba(26, 29, 33, 0.06);
+                  text-align: center;
+                }
+                .code {
+                  display: inline-block;
+                  padding: 4px 10px;
+                  margin-bottom: 16px;
+                  border-radius: 999px;
+                  background: #fff1f0;
+                  color: #c0362c;
+                  font-size: 13px;
+                  font-weight: 600;
+                  letter-spacing: 0.04em;
+                }
+                h1 { margin: 0 0 10px; font-size: 24px; font-weight: 650; }
+                p { margin: 0; color: #5b6570; font-size: 15px; line-height: 1.6; }
+                .hint {
+                  margin-top: 22px; padding-top: 18px;
+                  border-top: 1px solid #eef1f4;
+                  font-size: 13px; color: #8a949e;
+                }
+              </style>
+            </head>
+            <body>
+              <main class="card">
+                <div class="code">HTTP 503</div>
+                <h1>服务暂时不可用</h1>
+                <p>后端暂无可用实例，请稍后再试。<br/>若持续出现，请联系平台管理员。</p>
+                <div class="hint">Gateway · 自动错误页</div>
+              </main>
+            </body>
+            </html>
+          type: Inline
+        contentType: text/html; charset=utf-8
+        statusCode: 503
+      source: Local
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: http-eg-website-ssr-beta

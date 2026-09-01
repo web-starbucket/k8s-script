@@ -1,15 +1,9 @@
-# 响应头回写 x-request-id + x-trace-id
+# x-request-id + x-trace-id
 #
-# 注意：HCM 上不能 patch response_headers_to_add
-# （EG 反序列化会报 unknown field "response_headers_to_add" → Programmed=False）
-# 应追加到已有的 envoy.filters.http.header_mutation（你们已用它改 Server）
-#
-# 前提：
-#   extensionApis.enableEnvoyPatchPolicy: true
-#   EnvoyProxy tracing → Tempo（已开）
-#   数据面 Envoy >= 1.36（%TRACE_ID% 在 header mutation 里才可用）
-#
-# listener: <ns>/<gateway>/<listener>
+# header_mutation 下标（改完必须 delete + apply 本 Policy）：
+#   - 无 BTP / 无 custom_response → http_filters/0
+#   - 有 BTP.responseOverride（Accepted）→ http_filters/1
+# Programmed 报 unknown field "mutations" = 下标打到了 grpc_web，改另一档
 apiVersion: gateway.envoyproxy.io/v1alpha1
 kind: EnvoyPatchPolicy
 metadata:
@@ -35,12 +29,12 @@ spec:
         op: add
         path: /default_filter_chain/filters/0/typed_config/generate_request_id
         value: true
-    # http_filters[1] = header_mutation（[0]=custom_response）。若顺序变了，describe 失败后再改下标
+    # 先按无 custom_response（下标 0）恢复 x-trace-id；BTP Accepted 后再改成 /1
     - type: type.googleapis.com/envoy.config.listener.v3.Listener
       name: default/eg/http
       operation:
         op: add
-        path: /default_filter_chain/filters/0/typed_config/http_filters/1/typed_config/mutations/response_mutations/-
+        path: /default_filter_chain/filters/0/typed_config/http_filters/0/typed_config/mutations/response_mutations/-
         value:
           append:
             header:
