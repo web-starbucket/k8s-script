@@ -29,12 +29,13 @@ spec:
         op: add
         path: /default_filter_chain/filters/0/typed_config/generate_request_id
         value: true
-    # 先按无 custom_response（下标 0）恢复 x-trace-id；BTP Accepted 后再改成 /1
+    # 有 BTP.responseOverride 时 custom_response=[0]，header_mutation=[1]
+    # 删掉 BTP 后改回 http_filters/0
     - type: type.googleapis.com/envoy.config.listener.v3.Listener
       name: default/eg/http
       operation:
         op: add
-        path: /default_filter_chain/filters/0/typed_config/http_filters/0/typed_config/mutations/response_mutations/-
+        path: /default_filter_chain/filters/0/typed_config/http_filters/1/typed_config/mutations/response_mutations/-
         value:
           append:
             header:
