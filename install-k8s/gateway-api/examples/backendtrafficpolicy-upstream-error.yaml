@@ -1,4 +1,3 @@
----
 apiVersion: gateway.envoyproxy.io/v1alpha1
 kind: BackendTrafficPolicy
 metadata:
@@ -68,7 +67,7 @@ spec:
                 <div class="code">HTTP 503</div>
                 <h1>服务暂时不可用</h1>
                 <p>后端暂无可用实例，请稍后再试。<br/>若持续出现，请联系平台管理员。</p>
-                <div class="hint">Gateway · 自动错误页</div>
+                <div class="hint">Gateway</div>
               </main>
             </body>
             </html>
