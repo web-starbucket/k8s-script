@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
 # 从 config.yaml 删除/安装整套监控（串行、低并发，避免 etcd 超时）
 # 用法：
-#   bash install.sh            # 安装/升级
+#   bash install.sh            # 预拉镜像后安装/升级
+#   bash install.sh images     # 只打印并预下载镜像
 #   bash install.sh destroy    # 仅删除
 #   bash install.sh reinstall  # 全部删除后重建
+# 跳过预拉: SKIP_IMAGE_PULL=1 bash install.sh
 set -euo pipefail
 
 NS=monitoring
 DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$DIR"
+export DIR
 CFG="${DIR}/config.yaml"
 TMP="${DIR}/.generated"
 mkdir -p "$TMP"
 
-NODE_EXPORTER_IMAGE="registry.cn-chengdu.aliyuncs.com/obsbot/node-exporter:v1.8.2"
+NODE_EXPORTER_IMAGE="registry.cn-global.starbucket.com.cn/starbucket/docker.io/prom/node-exporter:v1.8.2"
 LOKI_PVC="storage-loki-0"
 LOKI_PV="pv-mon-loki"
 
@@ -41,6 +44,185 @@ fi
 
 log() { echo ">>> $*"; }
 pause() { local s="${1:-$SLEEP_STEP}"; log "等待 ${s}s（降低 API 压力）..."; sleep "$s"; }
+
+SSH_OPTS=(
+  -o StrictHostKeyChecking=no
+  -o UserKnownHostsFile=/dev/null
+  -o LogLevel=ERROR
+  -o BatchMode=yes
+  -o ConnectTimeout=8
+)
+
+K8S_NODES_FILE="${K8S_NODES_FILE:-${DIR}/../k8s-nodes.conf}"
+
+# 从 config.yaml 收集实际会拉起的镜像（跳过已关闭的 init / sidecar）
+list_images() {
+  python3 - <<'PY'
+import os, yaml
+
+cfg_path = os.path.join(os.environ.get("DIR", "."), "config.yaml")
+with open(cfg_path, encoding="utf-8") as f:
+    cfg = yaml.safe_load(f)
+
+kp = cfg.get("kubePrometheus") or {}
+g = kp.get("grafana") or {}
+ic = g.get("initChownData") or {}
+if not ic.get("enabled"):
+    ic.pop("image", None)
+loki = cfg.get("loki") or {}
+sc = loki.get("sidecar") or {}
+if not (sc.get("rules") or {}).get("enabled"):
+    sc.pop("image", None)
+if not (loki.get("gateway") or {}).get("enabled"):
+    (loki.get("gateway") or {}).pop("image", None)
+
+def collect(obj, out):
+    if isinstance(obj, dict):
+        repo = obj.get("repository")
+        if isinstance(repo, str) and repo.strip() and (
+            obj.get("registry") or obj.get("tag") is not None or obj.get("digest")
+        ):
+            registry = str(obj.get("registry") or "").strip().rstrip("/")
+            tag = str(obj.get("tag") or "").strip()
+            digest = str(obj.get("digest") or "").strip()
+            path = f"{registry}/{repo}" if registry else repo
+            if digest:
+                out.append(f"{path}@{digest}" if not tag else f"{path}:{tag}")
+            elif tag:
+                out.append(f"{path}:{tag}")
+        for v in obj.values():
+            collect(v, out)
+    elif isinstance(obj, list):
+        for i in obj:
+            collect(i, out)
+
+seen, images = set(), []
+acc = []
+collect(cfg, acc)
+for img in acc:
+    if img not in seen:
+        seen.add(img)
+        images.append(img)
+for img in images:
+    print(img)
+PY
+}
+
+pull_one_image() {
+  local img="$1"
+  if command -v crictl >/dev/null 2>&1; then
+    crictl pull "$img"
+  elif command -v ctr >/dev/null 2>&1; then
+    ctr -n k8s.io images pull "$img"
+  elif command -v nerdctl >/dev/null 2>&1; then
+    nerdctl pull "$img"
+  elif command -v docker >/dev/null 2>&1; then
+    docker pull "$img"
+  else
+    echo "错误: 需要 crictl / ctr / nerdctl / docker 之一才能预拉镜像"
+    return 1
+  fi
+}
+
+conf_node_ips() {
+  local f="$K8S_NODES_FILE"
+  [ -f "$f" ] || return 0
+  while IFS= read -r line || [ -n "${line:-}" ]; do
+    line="${line%%#*}"
+    line="${line//$'\r'/}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    [ -z "$line" ] && continue
+    [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && continue
+    IFS='|' read -r ip _ role _ _ <<<"$line"
+    ip="${ip// /}"
+    role="${role// /}"
+    [[ "$role" == "master" || "$role" == "worker" ]] || continue
+    [ -n "$ip" ] && echo "$ip"
+  done < "$f"
+}
+
+is_local_ip() {
+  local ip="$1" x
+  [[ "$ip" == "127.0.0.1" || "$ip" == "::1" ]] && return 0
+  for x in $(hostname -I 2>/dev/null || true); do
+    [ "$x" = "$ip" ] && return 0
+  done
+  return 1
+}
+
+prefetch_images() {
+  local imgs=() img i n ip ok fail
+  log "所需镜像（来自 config.yaml）"
+  while IFS= read -r img; do
+    [ -n "$img" ] && imgs+=("$img")
+  done < <(list_images)
+  if [ "${#imgs[@]}" -eq 0 ]; then
+    echo "错误: 未从 config.yaml 解析到镜像"
+    exit 1
+  fi
+  mkdir -p "$TMP"
+  printf '%s\n' "${imgs[@]}" > "${TMP}/images.txt"
+  echo "  共 ${#imgs[@]} 个："
+  echo "  ----------------------------------------"
+  i=0
+  for img in "${imgs[@]}"; do
+    i=$((i + 1))
+    printf "  %2d. %s\n" "$i" "$img"
+  done
+  echo "  ----------------------------------------"
+
+  if [ "${SKIP_IMAGE_PULL:-0}" = "1" ]; then
+    log "SKIP_IMAGE_PULL=1，跳过预下载"
+    return 0
+  fi
+
+  log "本机预下载镜像"
+  i=0
+  for img in "${imgs[@]}"; do
+    i=$((i + 1))
+    log "pull [${i}/${#imgs[@]}] ${img}"
+    if ! pull_one_image "$img"; then
+      echo "错误: 本机拉取失败: ${img}"
+      exit 1
+    fi
+  done
+  log "本机预下载完成"
+
+  n=0
+  while IFS= read -r ip; do
+    [ -n "$ip" ] || continue
+    is_local_ip "$ip" && continue
+    n=$((n + 1))
+  done < <(conf_node_ips)
+
+  if [ "$n" -eq 0 ]; then
+    log "未从 ${K8S_NODES_FILE} 解析到其它节点；DaemonSet（node-exporter / Promtail）请在各节点自行 crictl pull"
+    return 0
+  fi
+
+  log "按 k8s-nodes.conf 在其它节点预下载（免密 SSH）"
+  while IFS= read -r ip; do
+    [ -n "$ip" ] || continue
+    is_local_ip "$ip" && continue
+    log "节点 ${ip}"
+    ok=0
+    fail=0
+    for img in "${imgs[@]}"; do
+      if ssh -n "${SSH_OPTS[@]}" \
+        "root@${ip}" "command -v crictl >/dev/null && crictl pull '$img' || ctr -n k8s.io images pull '$img'"; then
+        ok=$((ok + 1))
+      else
+        echo "    失败: ${img}"
+        fail=$((fail + 1))
+      fi
+    done
+    if [ "$fail" -gt 0 ]; then
+      echo "警告: ${ip} 有 ${fail} 个镜像未拉成功（已成功 ${ok}）"
+    else
+      log "${ip} 完成（${ok}）"
+    fi
+  done < <(conf_node_ips)
+}
 
 wait_api() {
   log "检查 API / etcd 是否可用"
@@ -238,8 +420,8 @@ kp = cfg["kubePrometheus"]
 kp.setdefault("prometheus-node-exporter", {})
 kp["prometheus-node-exporter"]["enabled"] = True
 kp["prometheus-node-exporter"]["image"] = {
-    "registry": "registry.cn-chengdu.aliyuncs.com",
-    "repository": "obsbot/node-exporter",
+    "registry": "registry.cn-global.starbucket.com.cn/starbucket",
+    "repository": "docker.io/prom/node-exporter",
     "tag": "v1.8.2",
     "digest": "",
     "pullPolicy": "IfNotPresent",
@@ -434,9 +616,9 @@ fix_node_exporter() {
 
 install_all() {
   export DIR
-  gen
-
   echo "======== 安装监控（低并发串行）========"
+  prefetch_images
+  gen
   wait_api
   apply_nfs_slow
 
@@ -456,8 +638,8 @@ install_all() {
     helm upgrade --install kube-prometheus prometheus-community/kube-prometheus-stack \
       -n "$NS" \
       -f "$TMP/kube-prometheus.yaml" \
-      --set prometheus-node-exporter.image.registry=registry.cn-chengdu.aliyuncs.com \
-      --set prometheus-node-exporter.image.repository=obsbot/node-exporter \
+      --set prometheus-node-exporter.image.registry=registry.cn-global.starbucket.com.cn/starbucket \
+      --set prometheus-node-exporter.image.repository=docker.io/prom/node-exporter \
       --set prometheus-node-exporter.image.tag=v1.8.2 \
       --set prometheus-node-exporter.image.digest="" \
       --timeout 45m \
@@ -472,8 +654,8 @@ install_all() {
       helm upgrade --install kube-prometheus prometheus-community/kube-prometheus-stack \
         -n "$NS" \
         -f "$TMP/kube-prometheus.yaml" \
-        --set prometheus-node-exporter.image.registry=registry.cn-chengdu.aliyuncs.com \
-        --set prometheus-node-exporter.image.repository=obsbot/node-exporter \
+        --set prometheus-node-exporter.image.registry=registry.cn-global.starbucket.com.cn/starbucket \
+        --set prometheus-node-exporter.image.repository=docker.io/prom/node-exporter \
         --set prometheus-node-exporter.image.tag=v1.8.2 \
         --set prometheus-node-exporter.image.digest="" \
         --timeout 45m \
@@ -534,6 +716,10 @@ case "$cmd" in
   destroy|uninstall|delete)
     destroy
     ;;
+  images|pull|prefetch)
+    export DIR
+    prefetch_images
+    ;;
   reinstall)
     destroy
     pause 60
@@ -543,7 +729,7 @@ case "$cmd" in
     install_all
     ;;
   *)
-    echo "用法: bash install.sh [install|reinstall|destroy]"
+    echo "用法: bash install.sh [install|images|reinstall|destroy]"
     exit 1
     ;;
 esac

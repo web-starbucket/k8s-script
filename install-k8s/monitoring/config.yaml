@@ -4,8 +4,8 @@
 # =============================================================================
 
 nfs:
-  server: 172.16.10.120
-  basePath: /data/nfs/monitoring
+  server: 172.16.10.129
+  basePath: /data/nfs/shared/monitoring
 
 # ----- kube-prometheus-stack -----
 kubePrometheus:
@@ -17,8 +17,8 @@ kubePrometheus:
     adminUser: admin
     adminPassword: admin123456
     image:
-      registry: swr.cn-north-4.myhuaweicloud.com
-      repository: ddn-k8s/docker.io/grafana/grafana
+      registry: registry.cn-global.starbucket.com.cn/starbucket
+      repository: docker.io/grafana/grafana
       tag: "11.5.2"
       pullPolicy: IfNotPresent
     grafana.ini:
@@ -26,8 +26,8 @@ kubePrometheus:
         default_language: zh-Hans
     sidecar:
       image:
-        registry: swr.cn-north-4.myhuaweicloud.com
-        repository: ddn-k8s/quay.io/kiwigrid/k8s-sidecar
+        registry: registry.cn-global.starbucket.com.cn/starbucket
+        repository: quay.io/kiwigrid/k8s-sidecar
         tag: "1.28.0"
       datasources:
         enabled: true
@@ -44,8 +44,8 @@ kubePrometheus:
     initChownData:
       enabled: false
       image:
-        registry: swr.cn-north-4.myhuaweicloud.com
-        repository: ddn-k8s/docker.io/library/busybox
+        registry: registry.cn-global.starbucket.com.cn/starbucket
+        repository: docker.io/library/busybox
         tag: "1.36.1"
     service:
       type: NodePort
@@ -62,8 +62,8 @@ kubePrometheus:
     alertmanagerSpec:
       replicas: 1
       image:
-        registry: swr.cn-north-4.myhuaweicloud.com
-        repository: ddn-k8s/quay.io/prometheus/alertmanager
+        registry: registry.cn-global.starbucket.com.cn/starbucket
+        repository: quay.io/prometheus/alertmanager
         tag: "v0.27.0"
       storage:
         volumeClaimTemplate:
@@ -85,8 +85,8 @@ kubePrometheus:
       scrapeInterval: 30s
       evaluationInterval: 30s
       image:
-        registry: swr.cn-north-4.myhuaweicloud.com
-        repository: ddn-k8s/quay.io/prometheus/prometheus
+        registry: registry.cn-global.starbucket.com.cn/starbucket
+        repository: quay.io/prometheus/prometheus
         tag: "v2.54.1"
       storageSpec:
         volumeClaimTemplate:
@@ -113,29 +113,39 @@ kubePrometheus:
     tls:
       enabled: false
     image:
-      registry: registry.cn-chengdu.aliyuncs.com
-      repository: obsbot/prometheus-operator
+      registry: registry.cn-global.starbucket.com.cn/starbucket
+      repository: quay.io/prometheus-operator/prometheus-operator
       tag: "v0.77.2"
     prometheusConfigReloader:
       image:
-        registry: registry.cn-chengdu.aliyuncs.com
-        repository: obsbot/prometheus-config-reloader
+        registry: registry.cn-global.starbucket.com.cn/starbucket
+        repository: quay.io/prometheus-operator/prometheus-config-reloader
         tag: "v0.77.2"
   kube-state-metrics:
     enabled: true
     image:
-      registry: swr.cn-north-4.myhuaweicloud.com
-      repository: ddn-k8s/registry.k8s.io/kube-state-metrics/kube-state-metrics
+      registry: registry.cn-global.starbucket.com.cn/starbucket
+      repository: registry.k8s.io/kube-state-metrics/kube-state-metrics
       tag: "v2.13.0"
+    kubeRBACProxy:
+      image:
+        registry: registry.cn-global.starbucket.com.cn/starbucket
+        repository: quay.io/brancz/kube-rbac-proxy
+        tag: v0.18.1
   prometheus-node-exporter:
     enabled: true
     image:
-      registry: registry.cn-chengdu.aliyuncs.com
-      repository: obsbot/node-exporter
-      # 必须写死；chart 默认是 v1.8.2-distroless，obsbot 没有该 tag
+      registry: registry.cn-global.starbucket.com.cn/starbucket
+      repository: docker.io/prom/node-exporter
+      # 必须写死；chart 默认是 v1.8.2-distroless
       tag: "v1.8.2"
       digest: ""
       pullPolicy: IfNotPresent
+    kubeRBACProxy:
+      image:
+        registry: registry.cn-global.starbucket.com.cn/starbucket
+        repository: quay.io/brancz/kube-rbac-proxy
+        tag: v0.18.1
   kubeEtcd:
     enabled: false
   kubeControllerManager:
@@ -179,8 +189,8 @@ loki:
       retention_delete_delay: 2h
       delete_request_store: filesystem
     image:
-      registry: registry.cn-chengdu.aliyuncs.com
-      repository: obsbot/loki
+      registry: registry.cn-global.starbucket.com.cn/starbucket
+      repository: docker.io/grafana/loki
       tag: "3.3.2"
   singleBinary:
     replicas: 1
@@ -202,10 +212,10 @@ loki:
       limits:
         cpu: "1"
         memory: 2Gi
-  # 关闭规则 sidecar（会拉 docker.io/kiwigrid/k8s-sidecar）
+  # 关闭规则 sidecar（避免再拉 k8s-sidecar）
   sidecar:
     image:
-      repository: kiwigrid/k8s-sidecar
+      repository: registry.cn-global.starbucket.com.cn/starbucket/quay.io/kiwigrid/k8s-sidecar
     rules:
       enabled: false
   read:
@@ -224,6 +234,10 @@ loki:
       volumeClaimsEnabled: false
   gateway:
     enabled: true
+    image:
+      registry: registry.cn-global.starbucket.com.cn/starbucket
+      repository: docker.io/nginxinc/nginx-unprivileged
+      tag: "1.27.2-alpine"
     service:
       type: ClusterIP
   chunksCache:
@@ -248,8 +262,8 @@ loki:
 # ----- Promtail -----
 promtail:
   image:
-    registry: registry.cn-chengdu.aliyuncs.com
-    repository: obsbot/promtail
+    registry: registry.cn-global.starbucket.com.cn/starbucket
+    repository: docker.io/grafana/promtail
     tag: "3.3.2"
   config:
     clients:
