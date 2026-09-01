@@ -75,7 +75,8 @@ spec:
         contentType: text/html; charset=utf-8
         statusCode: 503
       source: Local
+  # 绑 Gateway：挂到 eg 上的所有 HTTPRoute 自动生效，不必逐条写 Route
   targetRefs:
     - group: gateway.networking.k8s.io
-      kind: HTTPRoute
-      name: http-eg-website-ssr-beta
+      kind: Gateway
+      name: eg
