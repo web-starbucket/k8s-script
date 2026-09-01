@@ -19,6 +19,8 @@ mkdir -p "$TMP"
 NODE_EXPORTER_IMAGE="registry.cn-global.starbucket.com.cn/starbucket/docker.io/prom/node-exporter:v1.8.2"
 LOKI_PVC="storage-loki-0"
 LOKI_PV="pv-mon-loki"
+TEMPO_PVC="storage-tempo-0"
+TEMPO_PV="pv-mon-tempo"
 
 # 节奏控制（可按机器调整）
 SLEEP_SHORT=3
@@ -267,9 +269,9 @@ helm_retry() {
   return 1
 }
 
-# 先单独、缓慢安装 CRD，减轻后续 helm 压力
+# 先单独安装 Prometheus Operator CRD，并等到 Established
 install_prometheus_crds() {
-  log "预装 kube-prometheus-stack CRD（串行 apply）"
+  log "预装 kube-prometheus-stack CRD"
   local crd_dir="${TMP}/kube-prom-chart"
   rm -rf "$crd_dir"
   mkdir -p "$crd_dir"
@@ -278,22 +280,61 @@ install_prometheus_crds() {
     helm pull prometheus-community/kube-prometheus-stack --untar 2>/dev/null \
       || helm pull prometheus-community/kube-prometheus-stack --untar
   )
-  local f
-  # charts 目录结构: kube-prometheus-stack/charts/... 或 kube-prometheus-stack/crds
-  local crds_path
-  crds_path=$(find "$crd_dir" -type d -name crds | head -1 || true)
-  if [ -z "${crds_path:-}" ]; then
-    log "未找到 CRD 目录，跳过预装（由 helm 安装时创建）"
-    return 0
-  fi
-  for f in "$crds_path"/*.yaml; do
+
+  local f n=0
+  while IFS= read -r f; do
     [ -f "$f" ] || continue
+    n=$((n + 1))
     wait_api
     log "apply CRD: $(basename "$f")"
-    kubectl apply --server-side --force-conflicts -f "$f" 2>/dev/null \
-      || kubectl apply -f "$f" || true
-    sleep "$SLEEP_SHORT"
+    kubectl apply --server-side --force-conflicts -f "$f" \
+      || kubectl apply -f "$f"
+    sleep 1
+  done < <(find "$crd_dir" -type f \( -name '*.yaml' -o -name '*.yml' \) \
+    | grep -E '/crds/' \
+    | grep -viE '/tests/|/templates/' \
+    || true)
+
+  if [ "$n" -eq 0 ]; then
+    echo "警告: chart 内未找到 CRD 文件，尝试从 GitHub 拉取 prometheus-operator CRD"
+    local gh="${GH_PROXY:-https://ghfast.top/}"
+    [[ "${gh}" == */ ]] || gh="${gh}/"
+    local url="${gh}https://github.com/prometheus-operator/prometheus-operator/releases/latest/download/stripped-down-crds.yaml"
+    if ! curl -fL --connect-timeout 20 -o "${TMP}/prom-crds.yaml" "$url"; then
+      url="${gh}https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/main/example/prometheus-operator-crd/monitoring.coreos.com_servicemonitors.yaml"
+      mkdir -p "${TMP}/prom-crds"
+      curl -fL --connect-timeout 20 -o "${TMP}/prom-crds/servicemonitors.yaml" "$url" \
+        || { echo "错误: 无法下载 ServiceMonitor CRD"; return 1; }
+      kubectl apply --server-side --force-conflicts -f "${TMP}/prom-crds/servicemonitors.yaml"
+    else
+      kubectl apply --server-side --force-conflicts -f "${TMP}/prom-crds.yaml"
+    fi
+  fi
+
+  log "等待 ServiceMonitor 等 CRD Established"
+  local crd
+  for crd in \
+    servicemonitors.monitoring.coreos.com \
+    podmonitors.monitoring.coreos.com \
+    probes.monitoring.coreos.com \
+    prometheuses.monitoring.coreos.com \
+    alertmanagers.monitoring.coreos.com \
+    prometheusagents.monitoring.coreos.com \
+    scrapeconfigs.monitoring.coreos.com \
+    thanosrulers.monitoring.coreos.com \
+    alertmanagerconfigs.monitoring.coreos.com \
+    prometheusrules.monitoring.coreos.com; do
+    if kubectl get crd "$crd" >/dev/null 2>&1; then
+      kubectl wait --for=condition=Established "crd/${crd}" --timeout=120s \
+        || echo "警告: CRD 未 Established: ${crd}"
+    fi
   done
+
+  if ! kubectl get crd servicemonitors.monitoring.coreos.com >/dev/null 2>&1; then
+    echo "错误: 仍没有 ServiceMonitor CRD，请检查 helm pull / 网络后重试"
+    return 1
+  fi
+  log "Prometheus Operator CRD 已就绪"
   pause "$SLEEP_STEP"
 }
 
@@ -392,6 +433,21 @@ spec:
     server: {server}
     path: {base_path}/loki
 """,
+  "05-pv-tempo.yaml": f"""apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pv-mon-tempo
+spec:
+  capacity:
+    storage: 20Gi
+  accessModes: ["ReadWriteMany"]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  mountOptions: ["nfsvers=4.1", "hard", "timeo=600"]
+  nfs:
+    server: {server}
+    path: {base_path}/tempo
+""",
 }
 
 for name, content in parts.items():
@@ -416,6 +472,24 @@ spec:
       storage: 50Gi
 """)
 
+with open(os.path.join(tmp, "tempo-pvc.yaml"), "w", encoding="utf-8") as f:
+    f.write(f"""apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: storage-tempo-0
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: tempo
+    app.kubernetes.io/instance: tempo
+spec:
+  accessModes: ["ReadWriteMany"]
+  storageClassName: ""
+  volumeName: pv-mon-tempo
+  resources:
+    requests:
+      storage: 20Gi
+""")
+
 kp = cfg["kubePrometheus"]
 kp.setdefault("prometheus-node-exporter", {})
 kp["prometheus-node-exporter"]["enabled"] = True
@@ -430,21 +504,26 @@ kp["prometheus-node-exporter"]["image"] = {
 loki = cfg["loki"]
 loki.setdefault("singleBinary", {})["replicas"] = 0
 
+tempo = cfg["tempo"]
+tempo["replicas"] = 0
+
 for name, data in [
     ("kube-prometheus.yaml", kp),
     ("loki.yaml", loki),
     ("promtail.yaml", cfg["promtail"]),
+    ("tempo.yaml", tempo),
 ]:
     with open(os.path.join(tmp, name), "w", encoding="utf-8") as f:
         yaml.safe_dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
 
 print("generated:", tmp)
 print("NFS 目录权限（在 {server} 执行）:".format(server=server))
-print(f"  mkdir -p {base_path}/{{prometheus,grafana,alertmanager,loki}}")
+print(f"  mkdir -p {base_path}/{{prometheus,grafana,alertmanager,loki,tempo}}")
 print(f"  chown -R 472:472 {base_path}/grafana")
 print(f"  chown -R 1000:2000 {base_path}/prometheus")
 print(f"  chown -R 1000:2000 {base_path}/alertmanager")
 print(f"  chown -R 10001:10001 {base_path}/loki")
+print(f"  chown -R 10001:10001 {base_path}/tempo")
 PY
 }
 
@@ -493,6 +572,9 @@ destroy() {
   helm -n "$NS" uninstall promtail 2>/dev/null || true
   pause "$SLEEP_STEP"
   wait_api
+  helm -n "$NS" uninstall tempo 2>/dev/null || true
+  pause "$SLEEP_STEP"
+  wait_api
   helm -n "$NS" uninstall loki 2>/dev/null || true
   pause "$SLEEP_STEP"
   wait_api
@@ -529,7 +611,7 @@ destroy() {
   fi
 
   log "串行删除 PV"
-  for pv in pv-mon-grafana pv-mon-prometheus pv-mon-alertmanager pv-mon-loki; do
+  for pv in pv-mon-grafana pv-mon-prometheus pv-mon-alertmanager pv-mon-loki pv-mon-tempo; do
     kubectl patch pv "$pv" --type=json -p='[{"op":"remove","path":"/spec/claimRef"}]' 2>/dev/null || true
     sleep 1
     kubectl delete pv "$pv" --ignore-not-found --wait=false 2>/dev/null || true
@@ -538,7 +620,7 @@ destroy() {
 
   wait_ns_gone
 
-  for pv in pv-mon-grafana pv-mon-prometheus pv-mon-alertmanager pv-mon-loki; do
+  for pv in pv-mon-grafana pv-mon-prometheus pv-mon-alertmanager pv-mon-loki pv-mon-tempo; do
     kubectl patch pv "$pv" --type=json -p='[{"op":"remove","path":"/spec/claimRef"}]' 2>/dev/null || true
     kubectl delete pv "$pv" --ignore-not-found --wait=false 2>/dev/null || true
     sleep 1
@@ -588,6 +670,63 @@ ensure_loki_pvc() {
   pause "$SLEEP_STEP"
 }
 
+ensure_tempo_pvc() {
+  log "校正 Tempo PVC (${TEMPO_PVC})"
+  kubectl -n "$NS" scale sts tempo --replicas=0 2>/dev/null || true
+  pause "$SLEEP_STEP"
+
+  kubectl -n "$NS" delete pvc "$TEMPO_PVC" --ignore-not-found --wait=false 2>/dev/null || true
+  sleep "$SLEEP_SHORT"
+  kubectl patch pv "$TEMPO_PV" --type=json -p='[{"op":"remove","path":"/spec/claimRef"}]' 2>/dev/null || true
+
+  for i in $(seq 1 40); do
+    kubectl -n "$NS" get pvc "$TEMPO_PVC" >/dev/null 2>&1 || break
+    sleep 1
+  done
+  for i in $(seq 1 40); do
+    st=$(kubectl get pv "$TEMPO_PV" -o jsonpath='{.status.phase}' 2>/dev/null || echo Missing)
+    [ "$st" = "Available" ] && break
+    if [ "$st" = "Released" ] || [ "$st" = "Bound" ]; then
+      kubectl patch pv "$TEMPO_PV" --type=json -p='[{"op":"remove","path":"/spec/claimRef"}]' 2>/dev/null || true
+    fi
+    sleep 1
+  done
+
+  wait_api
+  kubectl create -f "$TMP/tempo-pvc.yaml"
+  for i in $(seq 1 40); do
+    phase=$(kubectl -n "$NS" get pvc "$TEMPO_PVC" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+    [ "$phase" = "Bound" ] && break
+    sleep 1
+  done
+
+  kubectl -n "$NS" get pvc "$TEMPO_PVC"
+  phase=$(kubectl -n "$NS" get pvc "$TEMPO_PVC" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+  if [ "$phase" != "Bound" ]; then
+    echo "错误: ${TEMPO_PVC} 未 Bound"
+    kubectl -n "$NS" describe pvc "$TEMPO_PVC" | tail -30 || true
+    exit 1
+  fi
+  pause "$SLEEP_STEP"
+}
+
+# Envoy Gateway BackendRef 需要 gRPC；端口名已是 grpc-*，再显式打上 appProtocol
+patch_tempo_otlp_grpc() {
+  log "为 Tempo Service 4317 设置 appProtocol=grpc"
+  if ! kubectl -n "$NS" get svc tempo >/dev/null 2>&1; then
+    echo "警告: 未找到 Service tempo"
+    return 0
+  fi
+  kubectl -n "$NS" get svc tempo -o json | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+for p in d.get("spec", {}).get("ports", []):
+    if p.get("port") == 4317 or str(p.get("name") or "").startswith("grpc-tempo-otlp"):
+        p["appProtocol"] = "grpc"
+print(json.dumps(d))
+' | kubectl apply -f - >/dev/null
+}
+
 fix_node_exporter() {
   log "校正 node-exporter 镜像"
   for i in $(seq 1 40); do
@@ -630,7 +769,13 @@ install_all() {
   helm repo update
   pause "$SLEEP_STEP"
 
-  install_prometheus_crds
+  install_prometheus_crds || exit 1
+
+  # CRD 已就绪才 skip-crds；否则 helm 会报 ServiceMonitor mapping not found
+  if ! kubectl get crd servicemonitors.monitoring.coreos.com >/dev/null 2>&1; then
+    echo "错误: ServiceMonitor CRD 不存在，中止安装"
+    exit 1
+  fi
 
   # 优先 skip-crds（CRD 已串行预装）；失败再完整安装
   set +e
@@ -699,6 +844,45 @@ install_all() {
       --timeout 30m \
       --wait=false
 
+  # 手工装过、没有 volumeClaimTemplates 的 Tempo 无法原地加 NFS，先删 STS
+  if kubectl -n "$NS" get sts tempo >/dev/null 2>&1; then
+    vct=$(kubectl -n "$NS" get sts tempo -o jsonpath='{.spec.volumeClaimTemplates}' 2>/dev/null || true)
+    if [ -z "$vct" ] || [ "$vct" = "[]" ]; then
+      log "已有 Tempo STS 未挂 PVC，删除以便改用 NFS（emptyDir 数据会丢失）"
+      kubectl -n "$NS" delete sts tempo --wait=false --ignore-not-found 2>/dev/null || true
+      pause "$SLEEP_STEP"
+    fi
+  fi
+
+  helm_retry "安装 Tempo(replicas=0)" \
+    helm upgrade --install tempo grafana/tempo \
+      -n "$NS" \
+      -f "$TMP/tempo.yaml" \
+      --set replicas=0 \
+      --timeout 30m \
+      --wait=false
+
+  for i in $(seq 1 40); do
+    kubectl -n "$NS" get sts tempo >/dev/null 2>&1 && break
+    sleep 3
+  done
+
+  ensure_tempo_pvc
+
+  log "拉起 Tempo replicas=1"
+  kubectl -n "$NS" scale sts tempo --replicas=1
+  pause "$SLEEP_STEP"
+
+  helm_retry "同步 Tempo(replicas=1)" \
+    helm upgrade tempo grafana/tempo \
+      -n "$NS" \
+      -f "$TMP/tempo.yaml" \
+      --set replicas=1 \
+      --timeout 30m \
+      --wait=false
+
+  patch_tempo_otlp_grpc
+
   echo "======== 状态 ========"
   pause "$SLEEP_STEP"
   kubectl -n "$NS" get pod,pvc
@@ -709,6 +893,8 @@ install_all() {
   echo "Prometheus:   http://<节点IP>:30390"
   echo "Alertmanager: http://<节点IP>:30303"
   echo "日志: Grafana → Explore → Loki"
+  echo "追踪: Grafana → Explore → Tempo"
+  echo "OTLP: tempo.monitoring.svc.cluster.local:4317 (gRPC) / :4318 (HTTP)"
 }
 
 cmd="${1:-install}"

@@ -1,5 +1,5 @@
 # =============================================================================
-# 监控一体配置（Prometheus + Grafana + Alertmanager + Loki + Promtail）
+# 监控一体配置（Prometheus + Grafana + Alertmanager + Loki + Promtail + Tempo）
 # 使用：bash install.sh
 # =============================================================================
 
@@ -41,6 +41,26 @@ kubePrometheus:
         jsonData:
           maxLines: 1000
           timeout: 60
+      - name: Tempo
+        type: tempo
+        uid: tempo
+        access: proxy
+        url: http://tempo.monitoring.svc.cluster.local:3200
+        isDefault: false
+        jsonData:
+          tracesToLogsV2:
+            datasourceUid: loki
+            spanStartTimeShift: "-1m"
+            spanEndTimeShift: "1m"
+            filterByTraceID: true
+          tracesToMetrics:
+            datasourceUid: prometheus
+          serviceMap:
+            datasourceUid: prometheus
+          nodeGraph:
+            enabled: true
+          lokiSearch:
+            datasourceUid: loki
     initChownData:
       enabled: false
       image:
@@ -258,6 +278,60 @@ loki:
     rules:
       enabled: false
 
+# ----- Tempo（单实例，grafana/tempo chart；Service 名 tempo，查询口 3200，OTLP gRPC 4317）-----
+tempo:
+  replicas: 1
+  tempo:
+    registry: registry.cn-global.starbucket.com.cn/starbucket
+    repository: docker.io/grafana/tempo
+    tag: "2.7.2"
+    pullPolicy: IfNotPresent
+    reportingEnabled: false
+    retention: 168h   # 7d
+    # /ready 未就绪会 503；liveness 用 /metrics，避免探针把 Pod 杀掉
+    livenessProbe:
+      httpGet:
+        path: /metrics
+        port: 3200
+      initialDelaySeconds: 60
+      periodSeconds: 15
+      timeoutSeconds: 5
+      failureThreshold: 6
+      successThreshold: 1
+    readinessProbe:
+      httpGet:
+        path: /ready
+        port: 3200
+      initialDelaySeconds: 30
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 12
+      successThreshold: 1
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: "0.0.0.0:4317"
+          http:
+            endpoint: "0.0.0.0:4318"
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: "1"
+        memory: 2Gi
+  tempoQuery:
+    enabled: false
+  persistence:
+    enabled: true
+    enableStatefulSetAutoDeletePVC: false
+    accessModes:
+      - ReadWriteMany
+    size: 20Gi
+    storageClassName: ""
+  serviceMonitor:
+    enabled: false
 
 # ----- Promtail -----
 promtail:

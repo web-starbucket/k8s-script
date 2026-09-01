@@ -1,6 +1,6 @@
 ## Kubernetes 监控与日志
 
-一体部署：**Prometheus + Grafana + Alertmanager**（指标）与 **Loki + Promtail**（日志）。  
+一体部署：**Prometheus + Grafana + Alertmanager**（指标）、**Loki + Promtail**（日志）、**Tempo**（链路追踪）。  
 配置集中在 `config.yaml`，由 `install.sh` 串行安装（降低 etcd 压力）。
 
 ---
@@ -10,16 +10,18 @@
 ```text
   指标 ──► Prometheus ────────┐
   告警 ──► Alertmanager ──────┼──► Grafana ──► Dashboard / Explore
-  日志 ──► Promtail ──► Loki ─┘
+  日志 ──► Promtail ──► Loki ─┤
+  追踪 ──► OTLP ──► Tempo ────┘
 ```
 
 | 组件 | 作用 |
 |------|------|
 | Prometheus | 采集、存储指标 |
-| Grafana | 可视化（指标 + 日志） |
+| Grafana | 可视化（指标 + 日志 + 追踪） |
 | Alertmanager | 告警路由 |
 | Loki | 日志存储与查询（默认保留 60 天，到期自动删） |
 | Promtail | 各节点采集容器日志 |
+| Tempo | 链路追踪存储与查询（默认保留 7 天） |
 
 命名空间：`monitoring`
 
@@ -55,12 +57,13 @@ apt-get install -y python3-yaml
 NFS 服务器：`172.16.10.120`（以 `config.yaml` 中 `nfs.server` 为准）
 
 ```bash
-mkdir -p /data/nfs/monitoring/{prometheus,grafana,alertmanager,loki}
+mkdir -p /data/nfs/shared/monitoring/{prometheus,grafana,alertmanager,loki,tempo}
 
-chown -R 472:472     /data/nfs/monitoring/grafana
-chown -R 1000:2000   /data/nfs/monitoring/prometheus
-chown -R 1000:2000   /data/nfs/monitoring/alertmanager
-chown -R 10001:10001 /data/nfs/monitoring/loki
+chown -R 472:472     /data/nfs/shared/monitoring/grafana
+chown -R 1000:2000   /data/nfs/shared/monitoring/prometheus
+chown -R 1000:2000   /data/nfs/shared/monitoring/alertmanager
+chown -R 10001:10001 /data/nfs/shared/monitoring/loki
+chown -R 10001:10001 /data/nfs/shared/monitoring/tempo
 ```
 
 | 目录 | 用途 | 属主 (UID:GID) |
@@ -69,8 +72,9 @@ chown -R 10001:10001 /data/nfs/monitoring/loki
 | `.../prometheus` | Prometheus 数据 | 1000:2000 |
 | `.../alertmanager` | Alertmanager 数据 | 1000:2000 |
 | `.../loki` | Loki 数据 | 10001:10001 |
+| `.../tempo` | Tempo 追踪数据 | 10001:10001 |
 
-> Loki 的 PVC 名固定为 **`storage-loki-0`**（StatefulSet 约定），由脚本预建并绑定 `pv-mon-loki`。
+> Loki 的 PVC 名固定为 **`storage-loki-0`**，Tempo 为 **`storage-tempo-0`**，由脚本预建并分别绑定 `pv-mon-loki` / `pv-mon-tempo`。路径以 `config.yaml` 的 `nfs.basePath` 为准。
 
 #### 3.3 执行安装
 
@@ -86,8 +90,9 @@ bash install.sh destroy      # 仅删除
 
 - 串行操作、步骤间等待，减轻 etcd 超时  
 - CRD 逐个 apply，Helm 失败自动重试  
-- Loki 先 0 副本，校正 PVC 后再拉起  
+- Loki / Tempo 先 0 副本，校正 PVC 后再拉起  
 - node-exporter 强制使用 `v1.8.2`（禁止 `*-distroless`）
+- Tempo liveness 使用 `/metrics`（不要用 `/ready`，避免 503 重启）
 
 整次 `reinstall` 约 **15～30 分钟**，请勿中断。
 
@@ -103,8 +108,9 @@ bash install.sh
 
 ```yaml
 nfs:               # NFS 地址与根路径
-kubePrometheus:    # 指标栈 + Grafana（含 Loki 数据源）
+kubePrometheus:    # 指标栈 + Grafana（含 Loki / Tempo 数据源）
 loki:              # 日志存储
+tempo:             # 链路追踪（helm grafana/tempo）
 promtail:          # 日志采集
 ```
 
@@ -185,6 +191,15 @@ kubectl -n default run log-test --image=busybox:1.36 --restart=Never \
 # Grafana 查询：{namespace="default"} |= "hello-default"
 ```
 
+#### 5.3 看追踪（Tempo）
+
+1. 左侧 **Explore** → 数据源选 **Tempo**（不要选 Loki）  
+2. 时间范围用最近 15 分钟；界面若为 UTC，北京时间需减 8 小时  
+3. Search 即可；OTLP 上报地址：`tempo.monitoring.svc.cluster.local:4317`（gRPC）  
+4. Grafana 数据源 URL 必须是查询口 **3200**，不要填 4317  
+
+Envoy Gateway 在 `EnvoyProxy` 里把 tracing 指到上述 4317 后，访问业务入口才会产生 span。
+
 ---
 
 ### 6. 日常运维命令
@@ -200,6 +215,7 @@ kubectl -n monitoring logs -l app.kubernetes.io/name=grafana --tail=100
 kubectl -n monitoring logs prometheus-monitoring-prometheus-0 -c prometheus --tail=100
 kubectl -n monitoring logs loki-0 -c loki --tail=100
 kubectl -n monitoring logs -l app.kubernetes.io/name=promtail --tail=50
+kubectl -n monitoring logs -l app.kubernetes.io/name=tempo --tail=80
 
 # 健康
 curl -sS "http://<节点IP>:30390/-/healthy"
@@ -217,6 +233,7 @@ curl -sS "http://<节点IP>:30390/-/healthy"
 | Grafana + NFS | 关闭 `initChownData`，目录属主提前设为 472 |
 | Prometheus 权限 | 数据目录必须 `1000:2000` |
 | Loki 权限 | 数据目录必须 `10001:10001` |
+| Tempo 权限 | 数据目录必须 `10001:10001` |
 
 ---
 
@@ -281,15 +298,24 @@ bash install.sh reinstall
 
 该命名空间无 Pod 或尚无新日志时，Loki 不会出现对应 `namespace` 标签。用第 5.2 节方法造日志验证。
 
+#### 8.8 Tempo Liveness 503 / 反复重启
+
+Helm 默认 liveness 打 `/ready`，未就绪会 503 并被 kubelet 杀掉。脚本已改为 `/metrics`。NFS 目录需：
+
+```bash
+chown -R 10001:10001 /data/nfs/shared/monitoring/tempo
+```
+
 ---
 
 ### 9. 验收清单
 
 - [ ] `kubectl -n monitoring get pod` 主要组件 Ready  
-- [ ] PVC 均为 Bound；`storage-loki-0` → `pv-mon-loki`  
+- [ ] PVC 均为 Bound；`storage-loki-0` → `pv-mon-loki`，`storage-tempo-0` → `pv-mon-tempo`  
 - [ ] Grafana 可登录  
 - [ ] Dashboards 有节点/集群指标  
 - [ ] Explore → Loki 可查 `{namespace="monitoring"}`  
+- [ ] Explore → Tempo 能搜到最近 traces（需先有 OTLP 上报）  
 - [ ] Prometheus `/healthy`、Alertmanager 页面可打开  
 
 ---
@@ -317,3 +343,4 @@ kubectl -n monitoring get secret kube-prometheus-grafana \
 | Prometheus | `http://<节点IP>:30390` |
 | Alertmanager | `http://<节点IP>:30303` |
 | 查日志 | Grafana → Explore → **Loki** |
+| 查追踪 | Grafana → Explore → **Tempo** |

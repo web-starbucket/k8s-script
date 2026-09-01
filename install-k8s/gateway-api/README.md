@@ -456,13 +456,18 @@ kubectl -n envoy-gateway-system rollout restart deploy/envoy-gateway
 kubectl apply -f examples/envoypatch-echo-request-id.yaml
 ```
 
-核心是设置 HCM：`always_set_request_id_in_response: true`。
+核心是设置 HCM：`always_set_request_id_in_response: true`。  
+同一份 patch 还会写 **`x-trace-id`**（32 位 hex，给 Tempo 搜）。须数据面已开 OTLP tracing，否则 `%TRACE_ID%` 为空。
 
 3. 验证：
 
 ```bash
-curl -sI http://172.16.10.114:31258/ | grep -i x-request-id
-# 期望出现: x-request-id: <uuid>
+curl -sI http://172.16.10.114:31258/ | grep -iE 'x-request-id|x-trace-id'
+# 期望:
+#   x-request-id: <uuid>
+#   x-trace-id: <32位hex>
+# Tempo 用 x-trace-id 搜索
+```
 
 # 用该 ID 搜访问日志
 kubectl -n envoy-gateway-system logs \
