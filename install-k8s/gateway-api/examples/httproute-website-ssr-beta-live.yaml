@@ -11,6 +11,8 @@ spec:
       namespace: default
       kind: Gateway
       group: gateway.networking.k8s.io
+  hostnames:
+    - www.obsbot.lan
   rules:
     - matches:
         - path:

@@ -1,9 +1,13 @@
-# x-request-id + x-trace-id
+# x-request-id + x-trace-id（HTTP 80 与 HTTPS 443）
 #
-# header_mutation 下标（改完必须 delete + apply 本 Policy）：
-#   - 无 BTP / 无 custom_response → http_filters/0
+# 路径差异（重要）：
+#   - HTTP  : /default_filter_chain/filters/0/...
+#   - HTTPS : /filter_chains/0/filters/0/...   （TLS 在 filter_chains，没有 default_filter_chain）
+#
+# header_mutation 下标（改完必须 delete + apply）：
+#   - 无 BTP.responseOverride → http_filters/0
 #   - 有 BTP.responseOverride（Accepted）→ http_filters/1
-# Programmed 报 unknown field "mutations" = 下标打到了 grpc_web，改另一档
+# Programmed 报 unknown field "mutations" = 下标打错，改另一档
 apiVersion: gateway.envoyproxy.io/v1alpha1
 kind: EnvoyPatchPolicy
 metadata:
@@ -17,6 +21,7 @@ spec:
     kind: Gateway
     name: eg
   jsonPatches:
+    # ── HTTP :80（default_filter_chain）────────────────
     - type: type.googleapis.com/envoy.config.listener.v3.Listener
       name: default/eg/http
       operation:
@@ -29,13 +34,35 @@ spec:
         op: add
         path: /default_filter_chain/filters/0/typed_config/generate_request_id
         value: true
-    # 有 BTP.responseOverride 时 custom_response=[0]，header_mutation=[1]
-    # 删掉 BTP 后改回 http_filters/0
     - type: type.googleapis.com/envoy.config.listener.v3.Listener
       name: default/eg/http
       operation:
         op: add
         path: /default_filter_chain/filters/0/typed_config/http_filters/1/typed_config/mutations/response_mutations/-
+        value:
+          append:
+            header:
+              key: x-trace-id
+              value: "%TRACE_ID%"
+            append_action: OVERWRITE_IF_EXISTS_OR_ADD
+    # ── HTTPS :443（filter_chains[0]，不是 default_filter_chain）──
+    - type: type.googleapis.com/envoy.config.listener.v3.Listener
+      name: default/eg/https
+      operation:
+        op: add
+        path: /filter_chains/0/filters/0/typed_config/always_set_request_id_in_response
+        value: true
+    - type: type.googleapis.com/envoy.config.listener.v3.Listener
+      name: default/eg/https
+      operation:
+        op: add
+        path: /filter_chains/0/filters/0/typed_config/generate_request_id
+        value: true
+    - type: type.googleapis.com/envoy.config.listener.v3.Listener
+      name: default/eg/https
+      operation:
+        op: add
+        path: /filter_chains/0/filters/0/typed_config/http_filters/1/typed_config/mutations/response_mutations/-
         value:
           append:
             header:

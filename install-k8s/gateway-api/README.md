@@ -438,11 +438,14 @@ kubectl apply -f examples/envoypatch-echo-request-id.yaml
 核心是设置 HCM：`always_set_request_id_in_response: true`。  
 同一份 patch 还会写 **`x-trace-id`**（32 位 hex，给 Tempo 搜）。须数据面已开 OTLP tracing，否则 `%TRACE_ID%` 为空。
 
+开启 **HTTPS** 后，patch 必须同时打到 `default/eg/http` 和 `default/eg/https`（80 / 443 各一份 HCM）。只打 http 时，https 响应里没有这两个头。改完务必 `kubectl delete` 再 `apply`。
+
 3. 验证：
 
 ```bash
-curl -sI http://172.16.10.114:31258/ | grep -iE 'x-request-id|x-trace-id'
-# 期望:
+curl -sI http://172.16.10.250/ | grep -iE 'x-request-id|x-trace-id'
+curl -skI https://172.16.10.250/ | grep -iE 'x-request-id|x-trace-id'
+# 期望两边都有:
 #   x-request-id: <uuid>
 #   x-trace-id: <32位hex>
 # Tempo 用 x-trace-id 搜索

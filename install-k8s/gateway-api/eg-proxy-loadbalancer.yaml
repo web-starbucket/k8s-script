@@ -2,12 +2,24 @@
 # 不要与 API VIP 172.16.10.100 冲突
 # 先 bash ../metallb/install-metallb.sh，再 bash ensure-envoy-loadbalancer.sh
 # MetalLB 不允许同时写 spec.loadBalancerIP 和 metallb.universe.tf/loadBalancerIPs
+#
+# telemetry.tracing：数据面开 OTLP，%TRACE_ID% / x-trace-id 才有值（需集群里有 Tempo）
 apiVersion: gateway.envoyproxy.io/v1alpha1
 kind: EnvoyProxy
 metadata:
   name: eg-proxy
   namespace: envoy-gateway-system
 spec:
+  telemetry:
+    tracing:
+      # 排障可先 100；生产建议 1～10
+      samplingRate: 100
+      provider:
+        type: OpenTelemetry
+        backendRefs:
+          - name: tempo
+            namespace: monitoring
+            port: 4317
   provider:
     type: Kubernetes
     kubernetes:
