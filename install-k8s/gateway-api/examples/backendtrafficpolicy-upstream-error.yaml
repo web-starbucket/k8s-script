@@ -61,19 +61,6 @@ data:
           box-shadow: 0 24px 60px rgba(60, 100, 78, 0.07), 0 2px 0 rgba(255, 255, 255, 0.85) inset;
           animation: rise 0.6s ease-out both;
         }
-        .card::before {
-          content: "";
-          position: absolute;
-          left: 28px; right: 28px; top: 0;
-          height: 3px;
-          border-radius: 0 0 8px 8px;
-          background: linear-gradient(90deg, #c5e6d2, #8fcea8, #d4eedf);
-        }
-        .mark {
-          width: 44px; height: 44px;
-          margin: 0 auto 18px;
-          display: grid; place-items: center;
-        }
         .stage {
           position: relative;
           width: 88px; height: 88px;
@@ -148,14 +135,6 @@ data:
       <div class="orb orb-a"></div>
       <div class="orb orb-b"></div>
       <main class="card">
-        <div class="mark" aria-hidden="true">
-          <svg xmlns="http://www.w3.org/2000/svg" width="44" height="44" viewBox="0 0 64 64">
-            <rect x="2" y="2" width="60" height="60" rx="14" fill="#f5faf7" stroke="#dcebe2"/>
-            <circle cx="32" cy="32" r="16" fill="none" stroke="#dcebe2" stroke-width="5"/>
-            <path d="M32 16 a16 16 0 0 1 16 16" fill="none" stroke="#8fcea8" stroke-width="5" stroke-linecap="round"/>
-            <circle cx="32" cy="32" r="5" fill="#8fcea8"/>
-          </svg>
-        </div>
         <div class="stage" aria-hidden="true">
           <div class="glow"></div>
           <svg class="ring" viewBox="0 0 88 88">
@@ -167,7 +146,7 @@ data:
         </div>
         <div class="badge">HTTP 503</div>
         <h1>服务加载中</h1>
-        <p>后端暂时不可用，网关正在等待实例恢复。<br/>页面会在服务就绪后自动可用。</p>
+        <p>服务暂时不可用，网关正在等待故障恢复。<br/>感谢您的耐心等待！</p>
         <div class="dots" aria-hidden="true"><span></span><span></span><span></span></div>
         <div class="hint"><i></i> GATEWAY</div>
       </main>
