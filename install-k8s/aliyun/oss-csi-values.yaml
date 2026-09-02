@@ -1,0 +1,16 @@
+# kubeadm 裸机：只启用 OSS CSI，关闭云盘 / NAS
+# regionID 必须与 OSS Bucket 地域一致
+deploy:
+  regionID: cn-chengdu
+  ack: false
+  ecs: false
+  accessKey:
+    enabled: true
+    secretName: csi-access-key
+csi:
+  disk:
+    enabled: false
+  nas:
+    enabled: false
+  oss:
+    enabled: true

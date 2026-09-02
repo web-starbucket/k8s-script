@@ -1,0 +1,38 @@
+# 使用前：改 bucket / url / path；先创建 default/oss-secret
+# kubectl apply -f oss-pv-pvc.yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pv-oss
+spec:
+  capacity:
+    storage: 20Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: ossplugin.csi.alibabacloud.com
+    volumeHandle: pv-oss
+    nodePublishSecretRef:
+      name: oss-secret
+      namespace: default
+    volumeAttributes:
+      bucket: "YOUR-BUCKET"
+      url: "oss-cn-chengdu.aliyuncs.com"
+      path: "/k8s"
+      fuseType: ossfs
+      otherOpts: "-o allow_other -o umask=022 -o max_stat_cache_size=0"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-oss
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 20Gi
+  volumeName: pv-oss
+  storageClassName: ""
