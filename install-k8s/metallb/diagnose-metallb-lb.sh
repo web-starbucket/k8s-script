@@ -5,7 +5,7 @@ set -euo pipefail
 
 SYS_NS="envoy-gateway-system"
 SVC="${1:-envoy-default-eg-e41e7b31}"
-LB_IP="${LB_IP:-172.16.10.200}"
+LB_IP="${LB_IP:-172.16.10.250}"
 
 section() { echo; echo "======== $* ========"; }
 

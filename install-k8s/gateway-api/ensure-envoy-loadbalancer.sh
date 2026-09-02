@@ -11,7 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 GW_NAME="${1:-eg}"
 GW_NS="${2:-default}"
 SYS_NS="envoy-gateway-system"
-LB_IP="${LB_IP:-172.16.10.200}"
+LB_IP="${LB_IP:-172.16.10.250}"
 
 preflight_metallb() {
   if ! kubectl get ns metallb-system >/dev/null 2>&1; then
@@ -29,6 +29,8 @@ preflight_metallb() {
     exit 1
   fi
   echo "✅ MetalLB 已就绪"
+  kubectl apply -f "${SCRIPT_DIR}/../metallb/ipaddresspool.yaml"
+  echo "  已同步 IPAddressPool → ${LB_IP}"
   kubectl -n metallb-system get pods --no-headers 2>/dev/null | awk '{print "   "$1" "$3}' || true
 }
 
@@ -111,6 +113,19 @@ echo "  Service: ${SYS_NS}/${svc}"
 
 ensure_no_load_balancer_class "${svc}"
 patch_svc_lb "${svc}"
+
+# 改 VIP 后旧 EXTERNAL-IP 不在新池内，speaker 会拒配置；删掉让 EG 按新 annotation 重建
+cur_ext="$(kubectl -n "${SYS_NS}" get svc "${svc}" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
+if [[ -n "${cur_ext}" && "${cur_ext}" != "${LB_IP}" ]]; then
+  echo "  当前 EXTERNAL-IP=${cur_ext} ≠ ${LB_IP}，删除 Service 以便按新 VIP 重建…"
+  kubectl -n "${SYS_NS}" delete svc "${svc}" --wait=true
+  if ! svc="$(wait_for_data_plane_svc)"; then
+    echo "❌ 重建超时"
+    exit 1
+  fi
+  echo "  新 Service: ${SYS_NS}/${svc}"
+  patch_svc_lb "${svc}"
+fi
 
 echo "==> 等待 EXTERNAL-IP（MetalLB controller 分配）"
 ext=""

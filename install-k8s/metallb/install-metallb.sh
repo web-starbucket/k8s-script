@@ -15,7 +15,7 @@ kubectl apply -f /tmp/metallb-native.yaml
 kubectl -n "${NS}" wait --for=condition=Available deploy/controller --timeout=180s
 kubectl -n "${NS}" wait --for=condition=ready pod -l app=speaker --timeout=180s || true
 
-echo "==> 应用 IP 池（默认 172.16.10.200，勿与 API VIP .100 冲突）"
+echo "==> 应用 IP 池（默认 172.16.10.250，勿与 API VIP .100 冲突）"
 kubectl apply -f "${SCRIPT_DIR}/ipaddresspool.yaml"
 
 echo
@@ -24,4 +24,4 @@ kubectl get ipaddresspool,l2advertisement -n "${NS}"
 echo
 echo "下一步: 在 gateway-api 目录把 NodePort 改成 LoadBalancer"
 echo "  bash ensure-envoy-loadbalancer.sh"
-echo "访问: http://172.16.10.200/"
+echo "访问: http://172.16.10.250/"

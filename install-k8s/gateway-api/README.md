@@ -105,14 +105,14 @@ kubectl -n envoy-gateway-system get svc -l gateway.envoyproxy.io/owning-gateway-
 
 ### 2.1 （可选）改成 MetalLB LoadBalancer
 
-默认安装是 NodePort。要把入口改成局域网 VIP（默认 **`172.16.10.200:80`**）时，单独执行下面步骤。
+默认安装是 NodePort。要把入口改成局域网 VIP（默认 **`172.16.10.250:80`**）时，单独执行下面步骤。
 
-**不要占用 `172.16.10.100`**（kube-apiserver keepalived VIP）。`172.16.10.200` 是 MetalLB L2 宣告的另一个 VIP。
+**不要占用 `172.16.10.100`**（kube-apiserver keepalived VIP）。`172.16.10.250` 是 MetalLB L2 宣告的另一个 VIP。
 
 #### 步骤
 
 ```bash
-# 1) 安装 MetalLB + 地址池（默认 172.16.10.200/32）
+# 1) 安装 MetalLB + 地址池（默认 172.16.10.250/32）
 cd /opt/k8s-script/install-k8s/metallb
 # 改 VIP 时先编辑 ipaddresspool.yaml，并同步改 gateway-api/eg-proxy-loadbalancer.yaml 里的 annotation
 bash install-metallb.sh
@@ -130,12 +130,12 @@ bash ensure-envoy-loadbalancer.sh
 期望：
 
 ```text
-TYPE=LoadBalancer   EXTERNAL-IP=172.16.10.200   PORT(S)=80:xxxxx/TCP
+TYPE=LoadBalancer   EXTERNAL-IP=172.16.10.250   PORT(S)=80:xxxxx/TCP
 ```
 
-`PORT(S)` 里仍会带 NodePort，这是 LoadBalancer 的正常附带端口。对外用 VIP 的 **80/443**，域名 A 记录指到 `172.16.10.200`。
+`PORT(S)` 里仍会带 NodePort，这是 LoadBalancer 的正常附带端口。对外用 VIP 的 **80/443**，域名 A 记录指到 `172.16.10.250`。
 
-HTTPS：先建 `default/eg-tls`，再打开 `examples/gateway-http.yaml` 里的 443 listener。
+HTTPS：Secret `default/star.obsbot.lan` 已存在时 apply `examples/gateway-http.yaml`（含 443 listener），再确认数据面 Service 出现 443。
 
 #### 改 VIP 地址
 
@@ -159,7 +159,7 @@ kubectl -n metallb-system get pods
 kubectl get ipaddresspool,l2advertisement -n metallb-system
 kubectl -n metallb-system logs deploy/controller --tail=40
 kubectl -n envoy-gateway-system get svc -l gateway.envoyproxy.io/owning-gateway-name=eg
-curl -sI http://172.16.10.200/
+curl -sI http://172.16.10.250/
 ```
 
 若要改回 NodePort：`bash ensure-envoy-nodeport.sh`（会重新 apply 默认的 `eg-proxy.yaml`）。

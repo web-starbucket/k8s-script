@@ -1,4 +1,4 @@
-# 可选：数据面改为 MetalLB LoadBalancer（默认 VIP 172.16.10.200）
+# 可选：数据面改为 MetalLB LoadBalancer（默认 VIP 172.16.10.250）
 # 不要与 API VIP 172.16.10.100 冲突
 # 先 bash ../metallb/install-metallb.sh，再 bash ensure-envoy-loadbalancer.sh
 # MetalLB 不允许同时写 spec.loadBalancerIP 和 metallb.universe.tf/loadBalancerIPs
@@ -17,7 +17,7 @@ spec:
       envoyService:
         type: LoadBalancer
         annotations:
-          metallb.universe.tf/loadBalancerIPs: "172.16.10.200"
+          metallb.universe.tf/loadBalancerIPs: "172.16.10.250"
         patch:
           type: StrategicMerge
           value:

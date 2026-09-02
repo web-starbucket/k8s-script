@@ -1,5 +1,5 @@
-# HTTP 80 + HTTPS 443（443 需要同命名空间 TLS Secret default/eg-tls）
-# 没有证书时先注释掉 https listener，只开 80
+# HTTP 80 + HTTPS 443
+# TLS Secret 须与 Gateway 同命名空间：default/star.obsbot.lan（type kubernetes.io/tls）
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
@@ -14,14 +14,15 @@ spec:
       allowedRoutes:
         namespaces:
           from: All
-    # 有证书后再打开（kubectl -n default create secret tls eg-tls --cert=tls.crt --key=tls.key）
-    # - name: https
-    #   protocol: HTTPS
-    #   port: 443
-    #   tls:
-    #     mode: Terminate
-    #     certificateRefs:
-    #       - name: eg-tls
-    #   allowedRoutes:
-    #     namespaces:
-    #       from: All
+    - name: https
+      protocol: HTTPS
+      port: 443
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: star.obsbot.lan
+            kind: Secret
+            group: ""
+      allowedRoutes:
+        namespaces:
+          from: All
