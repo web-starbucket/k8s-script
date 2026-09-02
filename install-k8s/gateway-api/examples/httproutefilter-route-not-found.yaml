@@ -1,0 +1,185 @@
+# 未匹配到任何业务路由时返回自定义 HTML 404
+# 需挂在「PathPrefix: /、无 backend」的兜底 HTTPRoute 上（见文件末尾注释）
+# HTML/CSS 不要出现 % 字符
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: HTTPRouteFilter
+metadata:
+  name: route-not-found
+  namespace: default
+spec:
+  directResponse:
+    statusCode: 404
+    contentType: text/html; charset=utf-8
+    body:
+      type: Inline
+      inline: |
+        <!DOCTYPE html>
+        <html lang="zh-CN">
+        <head>
+          <meta charset="utf-8"/>
+          <meta name="viewport" content="width=device-width, initial-scale=1"/>
+          <title>页面不存在</title>
+          <style>
+            * { box-sizing: border-box; }
+            body {
+              margin: 0;
+              min-height: 100vh;
+              display: flex;
+              flex-direction: column;
+              justify-content: center;
+              align-items: center;
+              font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+              background: #f3f7f5;
+              color: #1a1d21;
+              overflow: hidden;
+            }
+            .orb {
+              position: fixed;
+              border-radius: 9999px;
+              filter: blur(64px);
+              pointer-events: none;
+              z-index: 0;
+            }
+            .orb-a {
+              width: 420px; height: 420px;
+              top: -120px; right: -80px;
+              background: #d7efe2;
+              opacity: 0.88;
+            }
+            .orb-b {
+              width: 360px; height: 360px;
+              bottom: -140px; left: -90px;
+              background: #e0f3e9;
+              opacity: 0.92;
+            }
+            .card {
+              position: relative;
+              z-index: 1;
+              width: 440px;
+              max-width: 92vw;
+              padding: 44px 36px 32px;
+              background: rgba(255, 255, 255, 0.9);
+              border: 1px solid rgba(255, 255, 255, 0.96);
+              border-radius: 24px;
+              text-align: center;
+              box-shadow: 0 24px 60px rgba(60, 100, 78, 0.07), 0 2px 0 rgba(255, 255, 255, 0.85) inset;
+              animation: rise 0.6s ease-out both;
+            }
+            .icon {
+              position: relative;
+              width: 88px; height: 88px;
+              margin: 8px auto 24px;
+              display: grid; place-items: center;
+            }
+            .icon-glow {
+              position: absolute;
+              width: 52px; height: 52px;
+              border-radius: 9999px;
+              background: #8fcea8;
+              opacity: 0.14;
+              filter: blur(10px);
+              animation: glow 1.8s ease-in-out infinite;
+            }
+            .icon svg { overflow: visible; }
+            .search-ring {
+              transform-origin: 44px 44px;
+              animation: ring-spin 3s linear infinite;
+            }
+            .search-lens {
+              transform-origin: 40px 40px;
+              animation: lens-pulse 1.4s ease-in-out infinite;
+            }
+            .search-handle {
+              transform-origin: 50px 50px;
+              animation: handle-swing 1.4s ease-in-out infinite;
+            }
+            .search-arc {
+              transform-origin: 40px 40px;
+              animation: arc-spin 1.1s linear infinite;
+            }
+            .badge {
+              display: inline-block;
+              margin-bottom: 12px;
+              padding: 4px 10px;
+              border-radius: 9999px;
+              background: #f0f8f3;
+              color: #5aa87a;
+              font-size: 11px;
+              font-weight: 700;
+              letter-spacing: 0.12em;
+            }
+            h1 {
+              margin: 0 0 10px;
+              font-size: 26px;
+              font-weight: 700;
+              letter-spacing: -0.02em;
+            }
+            p { margin: 0; color: #5b6570; font-size: 15px; line-height: 1.7; }
+            .hint {
+              display: flex;
+              align-items: center;
+              justify-content: center;
+              gap: 8px;
+              margin-top: 26px;
+              padding-top: 18px;
+              border-top: 1px solid #eef4f0;
+              font-size: 12px;
+              color: #8a949e;
+              letter-spacing: 0.08em;
+            }
+            .hint i {
+              width: 6px; height: 6px;
+              border-radius: 9999px;
+              background: #8fcea8;
+              box-shadow: 0 0 0 4px #eaf6ef;
+            }
+            @keyframes rise { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
+            @keyframes glow { from { opacity: 0.08; transform: scale(0.9); } to { opacity: 0.2; transform: scale(1.1); } }
+            @keyframes lens-pulse { from { transform: scale(0.94); } to { transform: scale(1.06); } }
+            @keyframes handle-swing { from { transform: rotate(-10deg); } to { transform: rotate(6deg); } }
+            @keyframes ring-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+            @keyframes arc-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+          </style>
+        </head>
+        <body>
+          <div class="orb orb-a"></div>
+          <div class="orb orb-b"></div>
+          <main class="card">
+            <div class="icon" aria-hidden="true">
+              <div class="icon-glow"></div>
+              <svg xmlns="http://www.w3.org/2000/svg" width="88" height="88" viewBox="0 0 88 88">
+                <circle class="search-ring" cx="44" cy="44" r="30" fill="none" stroke="#e6f2eb" stroke-width="5"/>
+                <circle class="search-lens" cx="40" cy="40" r="14" fill="none" stroke="#8fcea8" stroke-width="5"/>
+                <path class="search-arc" d="M40 26 a14 14 0 0 1 14 14" fill="none" stroke="#c5e6d2" stroke-width="5" stroke-linecap="round"/>
+                <path class="search-handle" d="M50 50 L62 62" fill="none" stroke="#8fcea8" stroke-width="5" stroke-linecap="round"/>
+              </svg>
+            </div>
+            <div class="badge">HTTP 404</div>
+            <h1>页面不存在</h1>
+            <p>没有匹配到可用路由，请检查访问地址。</p>
+            <div class="hint"><i></i> GATEWAY</div>
+          </main>
+        </body>
+        </html>
+# ---
+# 兜底 HTTPRoute 示例（单独 apply；不要和业务 /website 写在同一条更具体规则之后抢流量）
+# apiVersion: gateway.networking.k8s.io/v1
+# kind: HTTPRoute
+# metadata:
+#   name: http-eg-not-found
+#   namespace: default
+# spec:
+#   parentRefs:
+#     - name: eg
+#       namespace: default
+#   rules:
+#     - matches:
+#         - path:
+#             type: PathPrefix
+#             value: /
+#       filters:
+#         - type: ExtensionRef
+#           extensionRef:
+#             group: gateway.envoyproxy.io
+#             kind: HTTPRouteFilter
+#             name: route-not-found
