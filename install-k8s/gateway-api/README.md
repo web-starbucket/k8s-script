@@ -22,8 +22,10 @@
 | `install-eg.sh` | 一键安装 Gateway API + Envoy Gateway |
 | `uninstall-gateway.sh` | **一键彻底卸载**（CRD / 命名空间 / Webhook / RBAC） |
 | `eg-values.yaml` | Helm values |
-| `eg-proxy.yaml` | 数据面镜像 + GatewayClass（**强制 NodePort + Cluster**） |
-| `ensure-envoy-nodeport.sh` | 创建 Gateway 后纠正 Service，保证**所有节点**可访问 |
+| `eg-proxy.yaml` | 数据面镜像 + GatewayClass（默认 **NodePort**） |
+| `ensure-envoy-nodeport.sh` | 创建 Gateway 后纠正数据面为 NodePort + Cluster |
+| `eg-proxy-loadbalancer.yaml` | （可选）数据面改为 MetalLB LoadBalancer |
+| `ensure-envoy-loadbalancer.sh` | （可选）NodePort → MetalLB VIP，等待 EXTERNAL-IP |
 
 ---
 
@@ -84,107 +86,83 @@ bash install-eg.sh
 
 可选环境变量：`KUBECTL_TIMEOUT`（默认 180s）、`APPLY_RETRIES`（默认 6）、`APPLY_SLEEP`（默认 3 秒）、`IMAGE_REGISTRY`（私有仓前缀）。
 
-安装后创建入口，并**立刻**纠正数据面 Service：
+安装后创建入口，并**立刻**纠正数据面 Service（默认 NodePort）：
 
 ```bash
-kubectl apply -f - <<'EOF'
-apiVersion: gateway.networking.k8s.io/v1
-kind: Gateway
-metadata:
-  name: eg
-  namespace: default
-spec:
-  gatewayClassName: eg
-  listeners:
-    - name: http
-      protocol: HTTP
-      port: 80
-      allowedRoutes:
-        namespaces:
-          from: All
-EOF
+kubectl apply -f examples/gateway-http.yaml
 
-# 必做：NodePort + externalTrafficPolicy=Cluster（所有节点可访问）
 bash ensure-envoy-nodeport.sh
 
 kubectl get gateway eg -o wide
 kubectl -n envoy-gateway-system get svc -l gateway.envoyproxy.io/owning-gateway-name=eg
 ```
 
+期望：`TYPE=NodePort`，`externalTrafficPolicy=Cluster`。访问 `http://<任意节点IP>:<NodePort>/`。
+
+需要 **80/443 虚拟 IP** 时，再按 **2.1** 改成 MetalLB（不是默认安装步骤）。
+
 ---
 
-### 2.1 裸机多节点访问（必读，避免再踩坑）
+### 2.1 （可选）改成 MetalLB LoadBalancer
 
-#### 现象
+默认安装是 NodePort。要把入口改成局域网 VIP（默认 **`172.16.10.200:80`**）时，单独执行下面步骤。
 
-只有某一个节点能打开 Gateway，例如仅：
+**不要占用 `172.16.10.100`**（kube-apiserver keepalived VIP）。`172.16.10.200` 是 MetalLB L2 宣告的另一个 VIP。
+
+#### 步骤
+
+```bash
+# 1) 安装 MetalLB + 地址池（默认 172.16.10.200/32）
+cd /opt/k8s-script/install-k8s/metallb
+# 改 VIP 时先编辑 ipaddresspool.yaml，并同步改 gateway-api/eg-proxy-loadbalancer.yaml 里的 annotation
+bash install-metallb.sh
+
+# 2) Gateway 已存在（没有则先 apply）
+cd /opt/k8s-script/install-k8s/gateway-api
+kubectl apply -f examples/gateway-http.yaml
+
+# 3) 数据面 NodePort → LoadBalancer，等待 EXTERNAL-IP
+bash ensure-envoy-loadbalancer.sh
+```
+
+脚本会 apply `eg-proxy-loadbalancer.yaml`（同一 `EnvoyProxy/eg-proxy`），并给数据面 Service 加上 annotation `metallb.universe.tf/loadBalancerIPs`。
+
+期望：
 
 ```text
-http://172.16.10.117:32030/   # 通
-http://172.16.10.114:32030/   # 不通
+TYPE=LoadBalancer   EXTERNAL-IP=172.16.10.200   PORT(S)=80:xxxxx/TCP
 ```
 
-#### 原因
+`PORT(S)` 里仍会带 NodePort，这是 LoadBalancer 的正常附带端口。对外用 VIP 的 **80/443**，域名 A 记录指到 `172.16.10.200`。
 
-数据面 Service 默认常为：
+HTTPS：先建 `default/eg-tls`，再打开 `examples/gateway-http.yaml` 里的 443 listener。
 
-- `type: LoadBalancer`（裸机 EXTERNAL-IP 一直 `<pending>`）
-- 或 `externalTrafficPolicy: Local` → **只有跑着 Envoy Pod 的节点**上的 NodePort 能通
+#### 改 VIP 地址
 
-#### 正确配置（必须同时满足）
+同时改三处为同一 IP：
 
-| 字段 | 正确值 | 说明 |
-|------|--------|------|
-| `spec.type` | `NodePort` | 裸机不用云 LB |
-| `spec.externalTrafficPolicy` | **`Cluster`** | 任意节点 IP:NodePort 都转发到 Envoy |
-| NodePort | 如 `32030`（自动分配） | 所有节点共用同一 NodePort 号 |
+1. `install-k8s/metallb/ipaddresspool.yaml` 的 `addresses`
+2. `install-k8s/gateway-api/eg-proxy-loadbalancer.yaml` 的 `metallb.universe.tf/loadBalancerIPs`
+3. 环境变量 `LB_IP`（可选）：`LB_IP=172.16.10.201 bash ensure-envoy-loadbalancer.sh`
 
-`eg-proxy.yaml` 已写入上述策略；创建 Gateway 后再执行一次：
+#### 注意（踩过的坑）
+
+| 不要 | 原因 |
+|------|------|
+| 同时写 `spec.loadBalancerIP` 和 annotation `metallb.universe.tf/loadBalancerIPs` | MetalLB 报错，EXTERNAL-IP 永远 pending |
+| 写 `loadBalancerClass: metallb` | MetalLB v0.14 原生 manifest **没有** LoadBalancerClass CR |
+
+排查：
 
 ```bash
-bash ensure-envoy-nodeport.sh
+kubectl -n metallb-system get pods
+kubectl get ipaddresspool,l2advertisement -n metallb-system
+kubectl -n metallb-system logs deploy/controller --tail=40
+kubectl -n envoy-gateway-system get svc -l gateway.envoyproxy.io/owning-gateway-name=eg
+curl -sI http://172.16.10.200/
 ```
 
-手动纠正（与脚本等价）：
-
-```bash
-SVC=$(kubectl -n envoy-gateway-system get svc \
-  -l gateway.envoyproxy.io/owning-gateway-name=eg \
-  -o jsonpath='{.items[0].metadata.name}')
-
-kubectl -n envoy-gateway-system patch svc "$SVC" --type merge -p '{
-  "spec": {
-    "type": "NodePort",
-    "externalTrafficPolicy": "Cluster"
-  }
-}'
-
-kubectl -n envoy-gateway-system get svc "$SVC" \
-  -o jsonpath='type={.spec.type} policy={.spec.externalTrafficPolicy} nodePort={.spec.ports[0].nodePort}{"\n"}'
-```
-
-期望输出类似：
-
-```text
-type=NodePort policy=Cluster nodePort=32030
-```
-
-#### 自检（每个节点都应返回 200）
-
-```bash
-NP=$(kubectl -n envoy-gateway-system get svc \
-  -l gateway.envoyproxy.io/owning-gateway-name=eg \
-  -o jsonpath='{.items[0].spec.ports[0].nodePort}')
-
-for ip in $(kubectl get nodes -o jsonpath='{.items[*].status.addresses[?(@.type=="InternalIP")].address}'); do
-  echo -n "$ip:$NP -> "
-  curl -s -o /dev/null -w "%{http_code}\n" --connect-timeout 2 "http://$ip:$NP/" || echo fail
-done
-```
-
-网页访问：`http://<任意节点IP>:<NodePort>/`（例如 `http://172.16.10.114:32030/`）。
-
-若自检某节点失败，检查该节点防火墙是否放行 NodePort（如 `ufw allow 32030/tcp`）。
+若要改回 NodePort：`bash ensure-envoy-nodeport.sh`（会重新 apply 默认的 `eg-proxy.yaml`）。
 
 ---
 
@@ -219,7 +197,7 @@ bash uninstall-gateway.sh --yes
 bash install-eg.sh
 ```
 
-重装后创建 Gateway，**务必再执行** `bash ensure-envoy-nodeport.sh`。
+重装后创建 Gateway，再执行 `bash ensure-envoy-nodeport.sh`。若要用 MetalLB，再按 2.1 执行 `bash ensure-envoy-loadbalancer.sh`。
 
 ---
 

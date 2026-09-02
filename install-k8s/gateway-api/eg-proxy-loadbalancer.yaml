@@ -1,10 +1,11 @@
-# 数据面走 Obsbot 镜像
-# 裸机必配：NodePort + externalTrafficPolicy=Cluster
-# 否则默认 Local 时，只有跑着 Envoy Pod 的那一个节点 NodePort 能访问
+# 可选：数据面改为 MetalLB LoadBalancer（默认 VIP 172.16.10.200）
+# 不要与 API VIP 172.16.10.100 冲突
+# 先 bash ../metallb/install-metallb.sh，再 bash ensure-envoy-loadbalancer.sh
+# MetalLB 不允许同时写 spec.loadBalancerIP 和 metallb.universe.tf/loadBalancerIPs
 apiVersion: gateway.envoyproxy.io/v1alpha1
 kind: EnvoyProxy
 metadata:
-  name: eg-proxy-obsbot
+  name: eg-proxy
   namespace: envoy-gateway-system
 spec:
   provider:
@@ -12,14 +13,16 @@ spec:
     kubernetes:
       envoyDeployment:
         container:
-          image: registry.cn-chengdu.aliyuncs.com/obsbot/envoy:distroless-v1.38.0
+          image: docker.io/envoyproxy/envoy:distroless-v1.38.0
       envoyService:
-        type: NodePort
+        type: LoadBalancer
+        annotations:
+          metallb.universe.tf/loadBalancerIPs: "172.16.10.200"
         patch:
           type: StrategicMerge
           value:
             spec:
-              type: NodePort
+              type: LoadBalancer
               externalTrafficPolicy: Cluster
 ---
 apiVersion: gateway.networking.k8s.io/v1
@@ -31,5 +34,5 @@ spec:
   parametersRef:
     group: gateway.envoyproxy.io
     kind: EnvoyProxy
-    name: eg-proxy-obsbot
+    name: eg-proxy
     namespace: envoy-gateway-system

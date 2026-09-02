@@ -1,0 +1,20 @@
+# L2 地址池：给 Gateway LoadBalancer 用
+# 不要用 172.16.10.100（那是 kube-apiserver keepalived VIP）
+# 改地址：同时改本文件 + gateway-api/eg-proxy.yaml 里的 metallb.universe.tf/loadBalancerIPs
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: lan-pool
+  namespace: metallb-system
+spec:
+  addresses:
+    - 172.16.10.200/32
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: lan-l2
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - lan-pool

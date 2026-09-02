@@ -1,5 +1,5 @@
-# Gateway 同时开 HTTP（可挂 HTTPRoute + GRPCRoute）
-# 应用后执行: bash ensure-envoy-nodeport.sh
+# HTTP 80 + HTTPS 443（443 需要同命名空间 TLS Secret default/eg-tls）
+# 没有证书时先注释掉 https listener，只开 80
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
@@ -14,14 +14,14 @@ spec:
       allowedRoutes:
         namespaces:
           from: All
-    # 若 gRPC 要 TLS，再加 HTTPS listener（需证书 Secret）
+    # 有证书后再打开（kubectl -n default create secret tls eg-tls --cert=tls.crt --key=tls.key）
     # - name: https
     #   protocol: HTTPS
     #   port: 443
     #   tls:
     #     mode: Terminate
     #     certificateRefs:
-    #       - name: demo-tls
+    #       - name: eg-tls
     #   allowedRoutes:
     #     namespaces:
     #       from: All

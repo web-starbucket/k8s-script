@@ -1,5 +1,6 @@
 # 数据面 Envoy 镜像 + 裸机 NodePort（externalTrafficPolicy=Cluster）
 # 默认官方镜像；私有仓可 export IMAGE_REGISTRY=registry.example.com/myproj 后由 install-eg.sh 替换
+# 改 LoadBalancer / MetalLB 见 README「可选：改成 MetalLB」和 eg-proxy-loadbalancer.yaml
 apiVersion: gateway.envoyproxy.io/v1alpha1
 kind: EnvoyProxy
 metadata:
