@@ -1,0 +1,12 @@
+# 仅在 Postgres 数据目录为空时执行一次（对应 compose 的 docker-entrypoint-initdb.d）
+# 若已有 ./postgres/init-nexus.sql，把内容替换到下面
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init
+  namespace: nexus
+data:
+  01-init-nexus.sql: |
+    CREATE SCHEMA IF NOT EXISTS nexus;
+    GRANT ALL ON SCHEMA nexus TO nexus;
+    ALTER ROLE nexus SET search_path TO nexus, public;

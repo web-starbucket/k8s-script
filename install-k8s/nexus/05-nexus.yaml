@@ -1,0 +1,112 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: nexus
+  namespace: nexus
+spec:
+  type: ClusterIP
+  selector:
+    app: nexus
+  ports:
+    - name: http
+      port: 8081
+      targetPort: 8081
+---
+# 有状态单副本。OSS Nexus 不能 replicas>1 共用同一 /nexus-data
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: nexus
+  namespace: nexus
+spec:
+  serviceName: nexus
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nexus
+  template:
+    metadata:
+      labels:
+        app: nexus
+    spec:
+      securityContext:
+        fsGroup: 200
+        fsGroupChangePolicy: OnRootMismatch
+      initContainers:
+        - name: wait-postgres
+          image: registry.cn-chengdu.aliyuncs.com/obsbot/postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - until pg_isready -h postgres -p 5432 -U nexus -d nexus; do sleep 2; done
+      containers:
+        - name: nexus
+          image: registry.cn-chengdu.aliyuncs.com/obsbot/nexus3:3.94.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: nexus-postgres
+                  key: POSTGRES_DB
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: nexus-postgres
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nexus-postgres
+                  key: POSTGRES_PASSWORD
+            - name: NEXUS_DATASTORE_NEXUS_JDBCURL
+              value: "jdbc:postgresql://postgres:5432/$(POSTGRES_DB)?currentSchema=nexus"
+            - name: NEXUS_DATASTORE_NEXUS_USERNAME
+              value: $(POSTGRES_USER)
+            - name: NEXUS_DATASTORE_NEXUS_PASSWORD
+              value: $(POSTGRES_PASSWORD)
+            - name: NEXUS_DATASTORE_NEXUS_ADVANCED
+              value: maximumPoolSize=100
+            - name: INSTALL4J_ADD_VM_PARAMS
+              value: >-
+                -Xms3g -Xmx6g -XX:MaxDirectMemorySize=3g
+                -Djava.util.prefs.userRoot=/nexus-data/javaprefs
+          ports:
+            - containerPort: 8081
+              name: http
+          resources:
+            requests:
+              cpu: "1"
+              memory: 8Gi
+            limits:
+              cpu: "4"
+              memory: 12Gi
+          startupProbe:
+            httpGet:
+              path: /service/rest/v1/status
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 36
+          readinessProbe:
+            httpGet:
+              path: /service/rest/v1/status
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 4
+          livenessProbe:
+            httpGet:
+              path: /service/rest/v1/status
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 6
+          volumeMounts:
+            - name: data
+              mountPath: /nexus-data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: pvc-nexus-data

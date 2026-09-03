@@ -1,0 +1,17 @@
+# 依赖 Gateway eg 已有 listener name: mysql、port 3306（见 gateway-http.yaml）
+# 客户端：172.16.10.250:3306（或 DNS 指到该 VIP）
+# 把 backendRefs.name 改成实际 MySQL Service（端口按 Service 改）
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TCPRoute
+metadata:
+  name: mysql
+  namespace: default
+spec:
+  parentRefs:
+    - name: eg
+      namespace: default
+      sectionName: mysql
+  rules:
+    - backendRefs:
+        - name: mysql
+          port: 3306

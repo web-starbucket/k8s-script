@@ -1,0 +1,62 @@
+# 先在 NFS 上建目录：
+#   mkdir -p /data/nfs/shared/nexus/postgres /data/nfs/shared/nexus/data
+#   chown -R 70:70 /data/nfs/shared/nexus/postgres    # postgres:16-alpine uid
+#   chown -R 200:200 /data/nfs/shared/nexus/data      # nexus3 uid
+# Postgres 更宜用本地盘/块存储；NFS 仅作当前环境过渡
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pv-nexus-postgres
+spec:
+  capacity:
+    storage: 50Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: nexus-nfs
+  nfs:
+    server: 172.16.10.129
+    path: /data/nfs/shared/nexus/postgres
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-nexus-postgres
+  namespace: nexus
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+  volumeName: pv-nexus-postgres
+  storageClassName: nexus-nfs
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pv-nexus-data
+spec:
+  capacity:
+    storage: 200Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: nexus-nfs
+  nfs:
+    server: 172.16.10.129
+    path: /data/nfs/shared/nexus/data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-nexus-data
+  namespace: nexus
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 200Gi
+  volumeName: pv-nexus-data
+  storageClassName: nexus-nfs

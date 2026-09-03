@@ -1,0 +1,145 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: nexus
+spec:
+  type: ClusterIP
+  selector:
+    app: postgres
+  ports:
+    - name: pg
+      port: 5432
+      targetPort: 5432
+---
+# 有状态单副本；不要把 replicas 调到 2（没有复制协议）
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: nexus
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      securityContext:
+        fsGroup: 70
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: postgres
+          image: registry.cn-chengdu.aliyuncs.com/obsbot/postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          args:
+            - postgres
+            - -c
+            - max_connections=200
+            - -c
+            - shared_buffers=1GB
+            - -c
+            - effective_cache_size=4GB
+            - -c
+            - work_mem=16MB
+            - -c
+            - maintenance_work_mem=256MB
+            - -c
+            - wal_buffers=64MB
+            - -c
+            - checkpoint_completion_target=0.9
+            - -c
+            - min_wal_size=512MB
+            - -c
+            - max_wal_size=2GB
+            - -c
+            - max_worker_processes=8
+            - -c
+            - max_parallel_workers=4
+            - -c
+            - max_parallel_workers_per_gather=2
+            - -c
+            - max_parallel_maintenance_workers=2
+            - -c
+            - random_page_cost=1.1
+            - -c
+            - effective_io_concurrency=200
+            - -c
+            - huge_pages=off
+            - -c
+            - log_min_duration_statement=1000
+            - -c
+            - log_checkpoints=on
+            - -c
+            - log_lock_waits=on
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: nexus-postgres
+                  key: POSTGRES_DB
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: nexus-postgres
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nexus-postgres
+                  key: POSTGRES_PASSWORD
+          ports:
+            - containerPort: 5432
+              name: pg
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 10
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: initdb
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: pvc-nexus-postgres
+        - name: initdb
+          configMap:
+            name: postgres-init
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Gi
