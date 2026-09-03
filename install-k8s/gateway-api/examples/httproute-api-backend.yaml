@@ -1,0 +1,94 @@
+# api.obsbot.lan：HTTP 路径 + 根路径自定义 404
+# gRPC 必须用独立的 GRPCRoute（不能写进 HTTPRoute）
+# 先确保 HTTPRouteFilter route-not-found 已 apply
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: http-eg-backend
+  namespace: default
+spec:
+  hostnames:
+    - api.obsbot.lan
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: eg
+      namespace: default
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /opms
+      backendRefs:
+        - name: opms
+          port: 9030
+          weight: 1
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /mfs
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /
+      backendRefs:
+        - name: obsbot-devops
+          port: 8000
+          weight: 1
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.envoyproxy.io
+            kind: HTTPRouteFilter
+            name: route-not-found
+---
+# gRPC 没有自定义 /opms 这种前缀。线上路径由 .proto 决定，固定为：
+#   /{package.Service}/{Method}   例如 /opms.v1.OpmsService/GetStatus
+# GRPCRoute 用 method.service / method.method 匹配这两段，不能 URLRewrite 成 /opms
+# REST/grpc-gateway 的 /opms 仍走上面的 HTTPRoute，不要写进 GRPCRoute
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: grpc-eg-backend
+  namespace: default
+spec:
+  hostnames:
+    - api.obsbot.lan
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: eg
+      namespace: default
+  rules:
+    # 例：opms.v1.OpmsService/* → Service opms:9030
+    - matches:
+        - method:
+            service: opms.v1.OpmsService
+      backendRefs:
+        - name: opms
+          port: 9030
+          weight: 1
+    # 只转某一个 RPC 时同时写 method
+    # - matches:
+    #     - method:
+    #         service: opms.v1.OpmsService
+    #         method: GetStatus
+    # 例：mfs.v1.MfsService/* → Service obsbot-devops:8000
+    - matches:
+        - method:
+            service: mfs.v1.MfsService
+      backendRefs:
+        - name: obsbot-devops
+          port: 8000
+          weight: 1
+    # 未匹配上面的 RPC 走默认后端（不要放在最前，否则会吃掉全部流量）
+    - backendRefs:
+        - name: opms
+          port: 9030
+          weight: 1

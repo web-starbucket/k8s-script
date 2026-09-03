@@ -10,6 +10,8 @@ spec:
     - group: gateway.networking.k8s.io
       kind: Gateway
       name: eg
+  # HTTP/3（QUIC）：需 Gateway 已有 HTTPS 443；数据面 Service 会出现 UDP/443
+  http3: {}
   headers:
     lateResponseHeaders:
       set:
