@@ -18,7 +18,7 @@ spec:
         <head>
           <meta charset="utf-8"/>
           <meta name="viewport" content="width=device-width, initial-scale=1"/>
-          <title>页面不存在</title>
+          <title>OpS</title>
           <style>
             * { box-sizing: border-box; }
             body {
@@ -28,57 +28,95 @@ spec:
               flex-direction: column;
               justify-content: center;
               align-items: center;
-              font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
-              background: #f3f7f5;
-              color: #1a1d21;
+              font-family: "Söhne", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+              color: #e8f4ef;
               overflow: hidden;
+              background:
+                radial-gradient(ellipse 900px 620px at 12vw -8vh, rgba(45, 212, 191, 0.22), transparent 70vw),
+                radial-gradient(ellipse 760px 540px at 92vw 108vh, rgba(56, 189, 248, 0.16), transparent 68vw),
+                radial-gradient(ellipse 520px 420px at 70vw 18vh, rgba(110, 231, 183, 0.1), transparent 55vw),
+                linear-gradient(165deg, #07131a 0px, #0c2430 42vw, #0a1c26 100vw);
+            }
+            .mesh {
+              position: fixed;
+              inset: 0;
+              z-index: 0;
+              pointer-events: none;
+              background-image:
+                linear-gradient(rgba(148, 210, 190, 0.045) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(148, 210, 190, 0.045) 1px, transparent 1px);
+              background-size: 48px 48px;
+              mask-image: radial-gradient(ellipse 720px 520px at center, #000 20vw, transparent 78vw);
+              -webkit-mask-image: radial-gradient(ellipse 720px 520px at center, #000 20vw, transparent 78vw);
             }
             .orb {
               position: fixed;
               border-radius: 9999px;
-              filter: blur(64px);
+              filter: blur(72px);
               pointer-events: none;
               z-index: 0;
             }
             .orb-a {
-              width: 420px; height: 420px;
-              top: -120px; right: -80px;
-              background: #d7efe2;
-              opacity: 0.88;
+              width: 460px; height: 460px;
+              top: -160px; right: -100px;
+              background: #1f6f6a;
+              opacity: 0.55;
+              animation: drift 9s ease-in-out infinite alternate;
             }
             .orb-b {
-              width: 360px; height: 360px;
-              bottom: -140px; left: -90px;
-              background: #e0f3e9;
-              opacity: 0.92;
+              width: 420px; height: 420px;
+              bottom: -180px; left: -120px;
+              background: #1a4f78;
+              opacity: 0.48;
+              animation: drift 11s ease-in-out infinite alternate-reverse;
+            }
+            .orb-c {
+              width: 280px; height: 280px;
+              top: 38vh; left: 42vw;
+              background: #2a8f7a;
+              opacity: 0.22;
+              filter: blur(90px);
             }
             .card {
               position: relative;
               z-index: 1;
-              width: 440px;
+              width: 460px;
               max-width: 92vw;
-              padding: 44px 36px 32px;
-              background: rgba(255, 255, 255, 0.9);
-              border: 1px solid rgba(255, 255, 255, 0.96);
-              border-radius: 24px;
+              padding: 48px 40px 36px;
+              background: rgba(10, 28, 36, 0.72);
+              border: 1px solid rgba(126, 220, 196, 0.16);
+              border-radius: 28px;
               text-align: center;
-              box-shadow: 0 24px 60px rgba(60, 100, 78, 0.07), 0 2px 0 rgba(255, 255, 255, 0.85) inset;
-              animation: rise 0.6s ease-out both;
+              box-shadow:
+                0 30px 80px rgba(0, 0, 0, 0.35),
+                0 0 0 1px rgba(255, 255, 255, 0.03) inset,
+                0 1px 0 rgba(167, 243, 208, 0.08) inset;
+              backdrop-filter: blur(18px);
+              -webkit-backdrop-filter: blur(18px);
+              animation: rise 0.65s ease-out both;
+            }
+            .card::before {
+              content: "";
+              position: absolute;
+              top: 0; left: 36px; right: 36px;
+              height: 1px;
+              background: linear-gradient(90deg, transparent, rgba(94, 234, 212, 0.55), transparent);
             }
             .icon {
               position: relative;
-              width: 88px; height: 88px;
-              margin: 8px auto 24px;
-              display: grid; place-items: center;
+              width: 92px; height: 92px;
+              margin: 4px auto 30px;
+              display: grid;
+              place-items: center;
             }
             .icon-glow {
               position: absolute;
-              width: 52px; height: 52px;
+              width: 56px; height: 56px;
               border-radius: 9999px;
-              background: #8fcea8;
-              opacity: 0.14;
-              filter: blur(10px);
-              animation: glow 1.8s ease-in-out infinite;
+              background: #2dd4bf;
+              opacity: 0.18;
+              filter: blur(14px);
+              animation: glow 1.8s ease-in-out infinite alternate;
             }
             .icon svg { overflow: visible; }
             .search-ring {
@@ -87,11 +125,11 @@ spec:
             }
             .search-lens {
               transform-origin: 40px 40px;
-              animation: lens-pulse 1.4s ease-in-out infinite;
+              animation: lens-pulse 1.4s ease-in-out infinite alternate;
             }
             .search-handle {
               transform-origin: 50px 50px;
-              animation: handle-swing 1.4s ease-in-out infinite;
+              animation: handle-swing 1.4s ease-in-out infinite alternate;
             }
             .search-arc {
               transform-origin: 40px 40px;
@@ -99,63 +137,81 @@ spec:
             }
             .badge {
               display: inline-block;
-              margin-bottom: 12px;
-              padding: 4px 10px;
+              margin-bottom: 14px;
+              padding: 5px 12px;
               border-radius: 9999px;
-              background: #f0f8f3;
-              color: #5aa87a;
+              background: rgba(45, 212, 191, 0.12);
+              border: 1px solid rgba(94, 234, 212, 0.22);
+              color: #5eead4;
               font-size: 11px;
               font-weight: 700;
-              letter-spacing: 0.12em;
+              letter-spacing: 0.16em;
             }
             h1 {
-              margin: 0 0 10px;
-              font-size: 26px;
+              margin: 0 0 12px;
+              font-size: 42px;
               font-weight: 700;
-              letter-spacing: -0.02em;
+              letter-spacing: 0.08em;
+              line-height: 1.05;
+              background: linear-gradient(120deg, #f0fdfa 0px, #5eead4 48vw, #7dd3fc 100vw);
+              -webkit-background-clip: text;
+              background-clip: text;
+              color: transparent;
+              -webkit-text-fill-color: transparent;
             }
-            p { margin: 0; color: #5b6570; font-size: 15px; line-height: 1.7; }
+            p {
+              margin: 0 auto;
+              max-width: 340px;
+              color: #9db5ae;
+              font-size: 15px;
+              line-height: 1.75;
+              letter-spacing: 0.01em;
+            }
             .hint {
               display: flex;
               align-items: center;
               justify-content: center;
               gap: 8px;
-              margin-top: 26px;
+              margin-top: 28px;
               padding-top: 18px;
-              border-top: 1px solid #eef4f0;
+              border-top: 1px solid rgba(148, 210, 190, 0.1);
               font-size: 12px;
-              color: #8a949e;
-              letter-spacing: 0.08em;
+              color: #6f8b83;
+              letter-spacing: 0.14em;
             }
             .hint i {
               width: 6px; height: 6px;
               border-radius: 9999px;
-              background: #8fcea8;
-              box-shadow: 0 0 0 4px #eaf6ef;
+              background: #2dd4bf;
+              box-shadow: 0 0 0 4px rgba(45, 212, 191, 0.16);
+              animation: glow 1.6s ease-in-out infinite alternate;
             }
-            @keyframes rise { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
-            @keyframes glow { from { opacity: 0.08; transform: scale(0.9); } to { opacity: 0.2; transform: scale(1.1); } }
+            @keyframes rise { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } }
+            @keyframes glow { from { opacity: 0.1; transform: scale(0.92); } to { opacity: 0.28; transform: scale(1.08); } }
             @keyframes lens-pulse { from { transform: scale(0.94); } to { transform: scale(1.06); } }
             @keyframes handle-swing { from { transform: rotate(-10deg); } to { transform: rotate(6deg); } }
             @keyframes ring-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
             @keyframes arc-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+            @keyframes drift { from { transform: translate(0, 0); } to { transform: translate(-24px, 18px); } }
           </style>
         </head>
         <body>
+          <div class="mesh" aria-hidden="true"></div>
           <div class="orb orb-a"></div>
           <div class="orb orb-b"></div>
+          <div class="orb orb-c"></div>
           <main class="card">
             <div class="icon" aria-hidden="true">
               <div class="icon-glow"></div>
               <svg xmlns="http://www.w3.org/2000/svg" width="88" height="88" viewBox="0 0 88 88">
-                <circle class="search-ring" cx="44" cy="44" r="30" fill="none" stroke="#e6f2eb" stroke-width="5"/>
-                <circle class="search-lens" cx="40" cy="40" r="14" fill="none" stroke="#8fcea8" stroke-width="5"/>
-                <path class="search-arc" d="M40 26 a14 14 0 0 1 14 14" fill="none" stroke="#c5e6d2" stroke-width="5" stroke-linecap="round"/>
-                <path class="search-handle" d="M50 50 L62 62" fill="none" stroke="#8fcea8" stroke-width="5" stroke-linecap="round"/>
+                <circle class="search-ring" cx="44" cy="44" r="30" fill="none" stroke="rgba(94,234,212,0.12)" stroke-width="5"/>
+                <circle class="search-lens" cx="40" cy="40" r="14" fill="none" stroke="#2dd4bf" stroke-width="5"/>
+                <path class="search-arc" d="M40 26 a14 14 0 0 1 14 14" fill="none" stroke="#67e8f9" stroke-width="5" stroke-linecap="round"/>
+                <path class="search-handle" d="M50 50 L62 62" fill="none" stroke="#2dd4bf" stroke-width="5" stroke-linecap="round"/>
               </svg>
             </div>
             <div class="badge">HTTP 404</div>
-            <h1>页面不存在</h1>
+            <h1>OpS</h1>
             <p>没有匹配到可用路由，请检查访问地址。</p>
             <div class="hint"><i></i> GATEWAY</div>
           </main>

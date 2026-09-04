@@ -1,0 +1,181 @@
+# 节点 k8s-n3 上先执行（无保留数据时）：
+#   mkdir -p /data/k8s/volumes/postgres
+#   chown -R 999:999 /data/k8s/volumes/postgres
+# 密码请改掉后再 apply
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-obsbot
+  namespace: default
+type: Opaque
+stringData:
+  POSTGRES_DB: obsbot
+  POSTGRES_USER: obsbot
+  POSTGRES_PASSWORD: "CHANGE_ME"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: default
+  labels:
+    app: postgres
+    k8s.kuboard.cn/name: postgres
+spec:
+  type: ClusterIP
+  selector:
+    app: postgres
+  ports:
+    - name: pg
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: default
+  labels:
+    app: postgres
+    k8s.kuboard.cn/name: postgres
+spec:
+  serviceName: postgres
+  replicas: 1
+  podManagementPolicy: OrderedReady
+  revisionHistoryLimit: 10
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  selector:
+    matchLabels:
+      app: postgres
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - k8s-n3
+      securityContext:
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: postgres
+          image: registry.cn-global.starbucket.com.cn/starbucket/docker.io/library/postgres:16
+          imagePullPolicy: IfNotPresent
+          # command 会覆盖镜像 ENTRYPOINT，必须用 args，否则不会 initdb
+          args:
+            - postgres
+            - -c
+            - max_connections=200
+            - -c
+            - shared_buffers=1GB
+            - -c
+            - effective_cache_size=4GB
+            - -c
+            - work_mem=16MB
+            - -c
+            - maintenance_work_mem=256MB
+            - -c
+            - wal_buffers=64MB
+            - -c
+            - checkpoint_completion_target=0.9
+            - -c
+            - min_wal_size=512MB
+            - -c
+            - max_wal_size=2GB
+            - -c
+            - max_worker_processes=8
+            - -c
+            - max_parallel_workers=4
+            - -c
+            - max_parallel_workers_per_gather=2
+            - -c
+            - max_parallel_maintenance_workers=2
+            - -c
+            - random_page_cost=1.1
+            - -c
+            - effective_io_concurrency=200
+            - -c
+            - huge_pages=off
+            - -c
+            - log_min_duration_statement=1000
+            - -c
+            - log_checkpoints=on
+            - -c
+            - log_lock_waits=on
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-obsbot
+                  key: POSTGRES_DB
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-obsbot
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-obsbot
+                  key: POSTGRES_PASSWORD
+          ports:
+            - name: pg
+              containerPort: 5432
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "250m"
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          securityContext:
+            runAsUser: 999
+            runAsGroup: 999
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 10
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+            initialDelaySeconds: 40
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          volumeMounts:
+            - name: postgres-volume
+              mountPath: /var/lib/postgresql/data
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: postgres-volume
+          hostPath:
+            path: /data/k8s/volumes/postgres
+            type: DirectoryOrCreate
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Gi
