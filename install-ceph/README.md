@@ -36,7 +36,7 @@ ceph3 (MON / OSD)
 | `ceph-nodes.conf` | 版本、RBD 池、节点 IP / 密码 / OSD 盘 |
 | `install-ceph.sh` | 安装与运维 |
 | `csi/storageclass-rbd.yaml` | 业务集群 StorageClass |
-| `csi/secret.yaml.example` | CSI Secret 模板 |
+| `csi/secret.yaml.example` | CSI 模板；**monitors 从 `ceph-nodes.conf` 生成**（`csi-example` / `export-rbd`） |
 | `csi/generated/` | `export-rbd` 写出的真实密钥（已 gitignore） |
 
 ---
@@ -235,9 +235,17 @@ sudo bash install-ceph.sh osd --all-available-devices
 
 在 **Ceph bootstrap 节点**：
 
+改 `ceph-nodes.conf` 节点后先刷新模板（MON 地址从 conf 读取，不要手改 YAML 里的 IP）：
+
+```bash
+bash install-ceph.sh csi-example
+```
+
+导出带真实密钥的清单（同时会按 conf 重写 example 和 `csi/generated/secret.yaml`）：
+
 ```bash
 sudo bash install-ceph.sh export-rbd
-# 生成 csi/generated/secret.yaml（含 client.kubernetes 密钥）
+# 生成 csi/generated/secret.yaml（含 client.kubernetes 密钥；monitors 来自 conf）
 ```
 
 在 **K8s 控制面**（Helm 安装 [ceph-csi](https://github.com/ceph/ceph-csi) 的 RBD 图表，命名空间 `ceph-csi`）后：
@@ -264,7 +272,8 @@ ceph osd pool ls
 ceph auth get client.kubernetes
 ```
 
-`bash install-ceph.sh --help`
+`bash install-ceph.sh --help`  
+`bash install-ceph.sh help osd`（任意命令：`help <命令>` 或 `<命令> --help`）
 
 ---
 

@@ -184,6 +184,75 @@ list_node_lines() {
 
 list_ssh_nodes() { list_node_lines; }
 
+# 从 ceph-nodes.conf 生成 CSI monitors YAML 行（IP:6789）
+csi_monitors_yaml() {
+  list_node_lines | awk -F'|' '
+    {
+      ip = $1
+      gsub(/[[:space:]]/, "", ip)
+      if (ip == "") next
+      n++
+      ips[n] = ip
+    }
+    END {
+      for (i = 1; i <= n; i++) {
+        printf "          \"%s:6789\"", ips[i]
+        if (i < n) print ","
+        else print ""
+      }
+    }
+  '
+}
+
+write_csi_secret_yaml() {
+  local dest="$1" key="$2"
+  local mons
+  mons="$(csi_monitors_yaml)"
+  [[ -n "${mons}" ]] || err "ceph-nodes.conf 没有节点 IP，无法生成 CSI monitors"
+  mkdir -p "$(dirname "${dest}")"
+  cat >"${dest}" <<EOF
+# monitors 由 install-ceph.sh 按 ceph-nodes.conf 生成，勿手改 IP
+# 真实 userKey：sudo bash install-ceph.sh export-rbd → csi/generated/secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: csi-rbd-secret
+  namespace: ceph-csi
+stringData:
+  userID: kubernetes
+  userKey: "${key}"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ceph-csi-config
+  namespace: ceph-csi
+data:
+  config.json: |-
+    [
+      {
+        "clusterID": "ceph",
+        "monitors": [
+${mons}
+        ]
+      }
+    ]
+EOF
+}
+
+sync_csi_example_from_conf() {
+  write_csi_secret_yaml \
+    "${SCRIPT_DIR}/csi/secret.yaml.example" \
+    "REPLACE_WITH_ceph_auth_get-key_client.kubernetes"
+  log "已按 ${CEPH_NODES_FILE} 更新 ${SCRIPT_DIR}/csi/secret.yaml.example （monitors）"
+}
+
+cmd_csi_example() {
+  sync_csi_example_from_conf
+  echo
+  awk '/"monitors"/, /\]/' "${SCRIPT_DIR}/csi/secret.yaml.example" || true
+}
+
 ensure_sshpass() {
   command -v sshpass >/dev/null 2>&1 && return 0
   log "安装 sshpass"
@@ -387,6 +456,7 @@ cmd_hosts_all() {
   ensure_sshpass
   _wrap_hosts() { _remote_cmd hosts "$@"; }
   for_each_node _wrap_hosts
+  sync_csi_example_from_conf
 }
 
 cmd_ssh_keys() {
@@ -551,6 +621,7 @@ cmd_add_hosts() {
     run_ceph orch host add "${host}" "${ip}" || warn "host add ${host} 失败（可能已存在）"
   done < <(list_ssh_nodes)
   run_ceph orch host ls
+  sync_csi_example_from_conf
 }
 
 cmd_osd() {
@@ -618,6 +689,7 @@ cmd_pool() {
       mgr "profile rbd pool=${RBD_POOL}"
   fi
   run_ceph osd pool ls detail | grep -A6 "pool '${RBD_POOL}'" || run_ceph osd lspools
+  sync_csi_example_from_conf
 }
 
 cmd_status() {
@@ -638,40 +710,15 @@ cmd_status() {
 cmd_export_rbd() {
   need_root export-rbd
   [[ -f /etc/ceph/ceph.conf ]] || err "请先 bootstrap / pool"
-  local out key mons
+  local out key
   out="${SCRIPT_DIR}/csi/generated"
   mkdir -p "${out}"
   key="$(run_ceph auth get-key client.kubernetes 2>/dev/null || true)"
   [[ -n "${key}" ]] || err "没有 client.kubernetes，请先执行 pool"
-  mons="$(list_node_lines | awk -F'|' '{printf "          \"%s:6789\",\n", $1}' | sed '$s/,$//')"
-  cat >"${out}/secret.yaml" <<EOF
-apiVersion: v1
-kind: Secret
-metadata:
-  name: csi-rbd-secret
-  namespace: ceph-csi
-stringData:
-  userID: kubernetes
-  userKey: "${key}"
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: ceph-csi-config
-  namespace: ceph-csi
-data:
-  config.json: |-
-    [
-      {
-        "clusterID": "ceph",
-        "monitors": [
-${mons}
-        ]
-      }
-    ]
-EOF
+  sync_csi_example_from_conf
+  write_csi_secret_yaml "${out}/secret.yaml" "${key}"
   chmod 600 "${out}/secret.yaml"
-  log "已写入 ${out}/secret.yaml （含密钥，勿提交 git）"
+  log "已写入 ${out}/secret.yaml （含密钥，勿提交 git；monitors 来自 ceph-nodes.conf）"
   echo "业务集群："
   echo "  1. Helm 安装 ceph-csi RBD（namespace ceph-csi）"
   echo "  2. kubectl apply -f ${out}/secret.yaml"
@@ -683,43 +730,258 @@ cmd_help() {
   bin="$(basename "$0")"
   cat <<EOF
 
-独立 Ceph 集群（cephadm + RBD），不要装在业务 K8s 节点上。
+  install-ceph  ·  Ubuntu 24 + cephadm（独立集群，RBD）
+  ────────────────────────────────────────────────────────
+  版本  CEPH_RELEASE=${CEPH_RELEASE}    池  ${RBD_POOL}
+  配置  ${CEPH_NODES_FILE}
+  镜像  SKIP_MONITORING_STACK=${SKIP_MONITORING_STACK}
 
-顺序:
-  改 ceph-nodes.conf → 全员 prepare → ssh-keys → hosts-all
-  → bootstrap 节点: bootstrap → add-hosts → osd → pool → status
+  用法
+    bash ${bin} --help              本帮助
+    bash ${bin} -h
+    bash ${bin} help                同上
+    bash ${bin} help <命令>         某命令详情
+    bash ${bin} <命令> --help       同上
+    bash ${bin} <命令> -h
 
-用法  sudo bash ${bin} <命令>
+  安装顺序（均在 bootstrap 节点 ceph1 操作远程即可）
+    改 conf → ssh-keys → prepare-all → hosts-all
+    → bootstrap → add-hosts → osd → pool → status
 
-  prepare        本机：docker、chrony、lvm2、cephadm（开始时打印镜像列表）
-  prepare-all    管理机：对 conf 全部节点执行 prepare
-  images         打印当前部署需要的 Docker 镜像（不需要 root）
-  prepare-all    管理机：对 conf 全部节点执行 prepare
-  hosts          本机写入 /etc/hosts
-  hosts-all      全部节点刷新 hosts
-  ssh-keys       按 conf 分发 SSH 免密（cephadm 编排依赖）
-  bootstrap      仅 bootstrap 节点：创建集群 / MON / MGR / Dashboard
-  add-hosts      把其余节点加入 cephadm
-  osd            按节点表第 6 列磁盘创建 OSD
-                 --all-available-devices  需 conf OSD_ALLOW_ALL=1
-  pool           创建 RBD 池 ${RBD_POOL} 与 client.kubernetes
-  status         ceph -s / osd tree
-  export-rbd     导出业务 K8s 用的 CSI Secret/ConfigMap
-  help           本说明
+  命令
+    查看 / 准备
+      help / --help  本说明；help <命令> 看详情
+      images         打印本部署需要的 Docker 镜像（不必 root）
+      prepare        本机：docker、chrony、lvm2、cephadm
+      prepare-all    按 conf 远程 prepare（含本机）
+      hosts          本机写入 /etc/hosts
+      hosts-all      全部节点刷新 hosts，并按 conf 更新 CSI example
+      ssh-keys       按 conf 分发 SSH 免密（cephadm 编排依赖）
 
-配置  ${CEPH_NODES_FILE}
-版本  CEPH_RELEASE=${CEPH_RELEASE}
+    集群
+      bootstrap      仅 bootstrap 节点：MON / MGR / Dashboard
+      add-hosts      将其余 conf 节点加入 cephadm
+      osd            按节点表第 6 列磁盘创建 OSD
+      pool           创建 RBD 池与 client.kubernetes
+      status         ceph -s / host / osd tree
 
-OSD 盘必须是独立空盘，不要用系统盘。三副本至少 3 台、每台一块 OSD。
+    CSI（业务 K8s）
+      csi-example    按 conf 刷新 csi/secret.yaml.example 的 monitors
+      export-rbd     导出含真实 key 的 Secret（monitors 来自 conf）
+
+  配置要点（改 conf，不要改脚本）
+    节点   IP|主机名|角色|用户|密码|osd磁盘
+    角色   bootstrap 只能一行；其余 node
+    OSD    第 6 列必须是独立空盘（如 /dev/vdb），禁止系统盘
+    监控   SKIP_MONITORING_STACK=1 可跳过 cephadm 自带 Prometheus
+
+  不要装在业务 K8s Master/Worker 上。三副本至少 3 台、每台一块 OSD。
 
 EOF
+}
+
+usage_cmd() {
+  local c="$1"
+  local bin
+  bin="$(basename "$0")"
+  case "${c}" in
+    help|--help|-h)
+      cmd_help
+      ;;
+    images)
+      cat <<EOF
+
+  命令  images
+  ────────────────────────────────
+  作用  打印当前部署会拉的容器镜像及本机是否已有
+  用法  bash ${bin} images
+        bash ${bin} images --help
+  说明  第 1 个为 Ceph 主镜像（每台都要）；其余为监控栈（可 SKIP_MONITORING_STACK=1 跳过）
+  配置  CEPH_RELEASE=${CEPH_RELEASE}  CEPH_IMAGE=${CEPH_IMAGE:-（默认 quay.io/ceph/ceph）}
+
+EOF
+      ;;
+    prepare)
+      cat <<EOF
+
+  命令  prepare
+  ────────────────────────────────
+  作用  本机准备：主机名、hosts、chrony、docker、cephadm，并打印镜像列表；预拉 Ceph 主镜像
+  用法  sudo bash ${bin} prepare
+        sudo bash ${bin} prepare --help
+  说明  每台存储节点都要；从 ceph1 批量请用 prepare-all
+  镜像  开始时打印列表，同 images
+
+EOF
+      ;;
+    prepare-all)
+      cat <<EOF
+
+  命令  prepare-all
+  ────────────────────────────────
+  作用  按 ceph-nodes.conf 把脚本同步到各节点并远程执行 prepare
+  用法  sudo bash ${bin} prepare-all
+        sudo bash ${bin} prepare-all --help
+  前提  建议先 ssh-keys；否则需 conf 中真实 root 密码（sshpass）
+  远程  脚本放到 ${REMOTE_DIR}
+
+EOF
+      ;;
+    hosts)
+      cat <<EOF
+
+  命令  hosts
+  ────────────────────────────────
+  作用  按 conf 刷新本机 /etc/hosts（# ceph-cluster 段）并可改主机名
+  用法  sudo bash ${bin} hosts
+        sudo bash ${bin} hosts --help
+
+EOF
+      ;;
+    hosts-all)
+      cat <<EOF
+
+  命令  hosts-all
+  ────────────────────────────────
+  作用  对 conf 全部节点远程执行 hosts，并按 conf 刷新 csi/secret.yaml.example
+  用法  sudo bash ${bin} hosts-all
+        sudo bash ${bin} hosts-all --help
+  前提  ssh-keys 或 conf 密码
+
+EOF
+      ;;
+    ssh-keys)
+      cat <<EOF
+
+  命令  ssh-keys
+  ────────────────────────────────
+  作用  按 conf 用 sshpass 分发 root 公钥，并尽量做到节点互免密（cephadm 编排需要）
+  用法  sudo bash ${bin} ssh-keys
+        sudo bash ${bin} ssh-keys --help
+  说明  密码占位符「请改成真实密码」的节点会跳过
+
+EOF
+      ;;
+    bootstrap)
+      cat <<EOF
+
+  命令  bootstrap
+  ────────────────────────────────
+  作用  仅在 role=bootstrap 那台创建集群（MON/MGR/Dashboard）
+  用法  sudo bash ${bin} bootstrap
+        sudo bash ${bin} bootstrap --help
+  选项  conf：CLUSTER_NETWORK、CEPH_IMAGE、DASHBOARD_PASSWORD、SKIP_MONITORING_STACK
+  说明  必须在 bootstrap 节点本机执行；已有 /etc/ceph/ceph.conf 且 ceph -s 可用则跳过
+  访问  https://<bootstrap-ip>:8443  用户 admin
+
+EOF
+      ;;
+    add-hosts)
+      cat <<EOF
+
+  命令  add-hosts
+  ────────────────────────────────
+  作用  把 conf 里非 bootstrap 节点 ceph orch host add 进集群，并刷新 CSI example
+  用法  sudo bash ${bin} add-hosts
+        sudo bash ${bin} add-hosts --help
+  前提  已 bootstrap；目标机已 prepare 且与 ceph1 免密
+  扩容  在 conf 追加 node 行后，再跑 ssh-keys → prepare-all → hosts-all → add-hosts → osd
+
+EOF
+      ;;
+    osd)
+      cat <<EOF
+
+  命令  osd
+  ────────────────────────────────
+  作用  按节点表第 6 列块设备在对应主机创建 OSD（会清空该盘）
+  用法  sudo bash ${bin} osd
+        sudo bash ${bin} osd --all-available-devices
+        sudo bash ${bin} osd --help
+  选项  --all-available-devices  领取所有空闲盘；必须 conf OSD_ALLOW_ALL=1
+  禁止  系统盘（vda/sda 上的 /）、有数据的盘
+  盘符  以目标机 lsblk 为准，虚拟机常见 /dev/vdb 而不是 /dev/sdb
+
+EOF
+      ;;
+    pool)
+      cat <<EOF
+
+  命令  pool
+  ────────────────────────────────
+  作用  创建 RBD 池（默认 ${RBD_POOL}）、三副本，以及 CSI 用户 client.kubernetes
+  用法  sudo bash ${bin} pool
+        sudo bash ${bin} pool --help
+  配置  RBD_POOL  RBD_PG_NUM  size=3 min_size=2
+  随后  export-rbd 才能导出 CSI Secret
+
+EOF
+      ;;
+    status)
+      cat <<EOF
+
+  命令  status
+  ────────────────────────────────
+  作用  打印 ceph -s、orch host、osd tree 以及 conf 节点表（不含密码）
+  用法  bash ${bin} status
+        bash ${bin} status --help
+  说明  无 /etc/ceph/ceph.conf 时只打印节点表
+
+EOF
+      ;;
+    export-rbd)
+      cat <<EOF
+
+  命令  export-rbd
+  ────────────────────────────────
+  作用  读取 client.kubernetes 密钥，按 conf 节点 IP 生成 CSI Secret/ConfigMap
+  用法  sudo bash ${bin} export-rbd
+        sudo bash ${bin} export-rbd --help
+  产出  csi/generated/secret.yaml（含密钥，勿提交 git）
+        同时刷新 csi/secret.yaml.example（monitors 来自 conf，key 为占位符）
+  前提  已 pool；在业务集群 kubectl apply generated 文件 + storageclass-rbd.yaml
+
+EOF
+      ;;
+    csi-example)
+      cat <<EOF
+
+  命令  csi-example
+  ────────────────────────────────
+  作用  只根据 ceph-nodes.conf 重写 csi/secret.yaml.example 的 monitors（不必装集群）
+  用法  bash ${bin} csi-example
+        bash ${bin} csi-example --help
+  说明  改节点 IP 后先跑本命令，不要手改 YAML 里的 6789 地址
+  密钥  占位符；真实 key 用 export-rbd
+
+EOF
+      ;;
+    *)
+      warn "没有命令「${c}」的说明"
+      echo "  用法: bash ${bin} help <命令>   或  bash ${bin} <命令> --help"
+      echo "  总览: bash ${bin} --help"
+      ;;
+  esac
 }
 
 main() {
   local cmd="${1:-help}"
   shift || true
   case "${cmd}" in
-    -h|--help|help) cmd_help ;;
+    -h|--help|help)
+      if [[ $# -gt 0 && "${1}" != "-h" && "${1}" != "--help" ]]; then
+        usage_cmd "${1}"
+      else
+        cmd_help
+      fi
+      return 0
+      ;;
+  esac
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage_cmd "${cmd}"
+    return 0
+  fi
+  case "${cmd}" in
     images)         cmd_images ;;
     prepare)        cmd_prepare "$@" ;;
     prepare-all)    cmd_prepare_all "$@" ;;
@@ -732,7 +994,8 @@ main() {
     pool)           cmd_pool "$@" ;;
     status)         cmd_status "$@" ;;
     export-rbd)     cmd_export_rbd "$@" ;;
-    *) err "未知命令: ${cmd}（bash $0 help）" ;;
+    csi-example)    cmd_csi_example "$@" ;;
+    *) err "未知命令: ${cmd}（bash $0 --help  或  bash $0 help <命令>）" ;;
   esac
 }
 
