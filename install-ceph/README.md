@@ -78,6 +78,14 @@ CEPH_APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/ceph/debian-reef
 → bootstrap → add-hosts → osd → pool → status
 ```
 
+`prepare` / `prepare-all` / `bootstrap` 开始时会打印本部署要拉的镜像；也可单独查看：
+
+```bash
+bash install-ceph.sh images
+```
+
+默认（reef）包括 `quay.io/ceph/ceph:v18` 以及 cephadm 监控栈（Prometheus / Alertmanager / node-exporter / Grafana）。已有业务监控时在 conf 设 `SKIP_MONITORING_STACK=1`。
+
 ```bash
 chmod +x install-ceph.sh
 chmod 600 ceph-nodes.conf
@@ -118,7 +126,112 @@ sudo bash install-ceph.sh osd --all-available-devices
 
 ---
 
-### 6. 接到业务 Kubernetes（RBD CSI）
+### 6. 扩容与缩容
+
+Ceph **不会**按负载自动加减节点（不像 K8s HPA）。扩缩是运维操作：加盘/加机会触发数据再平衡；缩容必须先把 OSD 上的数据迁走。  
+业务 PVC 变大走 StorageClass 扩容，和本节「加减存储机」不是一回事。
+
+所有命令默认在 **ceph1（bootstrap）** 上执行。OSD 只能用**独立空盘**（`lsblk` 无挂载），禁止系统盘（`vda` / `sda` 上的 `/`）。
+
+#### 6.1 扩容：只加盘（同一台已有节点）
+
+新盘挂到 ceph1/2/3 之一后：
+
+```bash
+lsblk -o NAME,SIZE,TYPE,MOUNTPOINT   # 确认新盘如 /dev/vdb，无 MOUNTPOINT
+```
+
+改 `ceph-nodes.conf` 该节点第 6 列（多块盘逗号分隔）：
+
+```text
+172.16.10.131|ceph1|bootstrap|root|你的密码|/dev/vdb,/dev/vdc
+```
+
+```bash
+sudo bash install-ceph.sh osd
+ceph -s          # 等到 HEALTH_OK，无 recovery / backfill 再视为完成
+ceph osd tree
+```
+
+#### 6.2 扩容：加一台存储机
+
+新机同样要有系统盘 + **一块空数据盘**。角色用 `node`（`bootstrap` 只能有一行）。
+
+1. 在 `ceph-nodes.conf` 追加，例如：
+
+```text
+172.16.10.134|ceph4|node|root|你的密码|/dev/vdb
+```
+
+盘符以**新机**上 `lsblk` 为准（虚拟机常见 `/dev/vdb`，不是 `/dev/sdb`）。
+
+2. 在 ceph1 上：
+
+```bash
+sudo bash install-ceph.sh ssh-keys
+sudo bash install-ceph.sh hosts-all
+sudo bash install-ceph.sh prepare-all
+sudo bash install-ceph.sh add-hosts
+sudo bash install-ceph.sh osd
+sudo bash install-ceph.sh status
+```
+
+`add-hosts` 把 conf 里尚未加入的主机 `ceph orch host add`；`osd` 按第 6 列建 OSD。集群会自动把部分 PG 迁到新 OSD。
+
+3. 确认完成：
+
+```bash
+ceph -s              # HEALTH_OK，无 recovery / backfill
+ceph orch host ls
+ceph osd tree        # 新主机上有 OSD 且 up
+```
+
+MON 保持 **奇数**。三台够用就不要加 MON；若要 5 个 MON：
+
+```bash
+ceph orch apply mon --placement="ceph1,ceph2,ceph3,ceph4,ceph5"
+```
+
+容量不够时：**先加盘，再加人。** 不要按 `ceph df` 水位自动删节点。
+
+#### 6.3 缩容：下线一台（须手工，脚本无 remove-host）
+
+**三节点集群不要缩到 2 台**（MON 不够票会停写；`size=3` 也无法放三副本）。最小生产规模就是 3 台。
+
+假设去掉 `ceph4`，OSD id 以 `ceph osd tree` 为准：
+
+```bash
+ceph osd tree
+# 可选：先把权重打到 0，搬数据更温和
+# ceph osd crush reweight osd.<id> 0
+
+ceph orch osd rm <id> --zap          # 可对多个 id 各执行一次
+ceph -s                              # 等到无 recovery，该 OSD 从 tree 消失
+
+ceph orch host drain ceph4
+ceph orch host rm ceph4              # 确认该机已无 OSD 后再删
+# 节点已关机且确认无数据：ceph orch host rm ceph4 --offline
+```
+
+然后从 `ceph-nodes.conf` 删除对应行，并 `sudo bash install-ceph.sh hosts-all` 刷新 hosts。
+
+#### 6.4 不要自动做的事
+
+| 做法 | 说明 |
+|------|------|
+| 按 CPU/磁盘使用率自动加虚拟机 | rebalance 会打满网络和 OSD，容易拖垮现网 |
+| 按水位自动 `host rm` | 缩容期间副本减少，再挂一台可能丢数据 |
+| `osd --all-available-devices` 当自动扩容 | 仅当 conf `OSD_ALLOW_ALL=1` 且插入的是**空盘**；插错系统盘会清空系统 |
+
+半自动加盘（谨慎）：conf 设 `OSD_ALLOW_ALL=1` 后：
+
+```bash
+sudo bash install-ceph.sh osd --all-available-devices
+```
+
+---
+
+### 7. 接到业务 Kubernetes（RBD CSI）
 
 在 **Ceph bootstrap 节点**：
 
@@ -141,7 +254,7 @@ Helm 的 `csiConfig` 须与 Secret 里 `clusterID: ceph` 一致；具体 values 
 
 ---
 
-### 7. 常用检查
+### 8. 常用检查
 
 ```bash
 ceph -s
@@ -155,7 +268,7 @@ ceph auth get client.kubernetes
 
 ---
 
-### 8. 和业务集群的关系
+### 9. 和业务集群的关系
 
 | 集群 | 机器 | 装什么 |
 |------|------|--------|

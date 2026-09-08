@@ -20,6 +20,7 @@ _CONF_RBD_PG_NUM=""
 _CONF_CLUSTER_NETWORK=""
 _CONF_DASHBOARD_PASSWORD=""
 _CONF_OSD_ALLOW_ALL=""
+_CONF_SKIP_MONITORING_STACK=""
 
 is_conf_kv_line() {
   [[ "${1:-}" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]
@@ -50,6 +51,7 @@ load_conf_kv() {
       CLUSTER_NETWORK) _CONF_CLUSTER_NETWORK="${val}" ;;
       DASHBOARD_PASSWORD) _CONF_DASHBOARD_PASSWORD="${val}" ;;
       OSD_ALLOW_ALL) _CONF_OSD_ALLOW_ALL="${val}" ;;
+      SKIP_MONITORING_STACK) _CONF_SKIP_MONITORING_STACK="${val}" ;;
     esac
   done <"${f}"
 }
@@ -68,6 +70,7 @@ RBD_PG_NUM="${RBD_PG_NUM:-${_CONF_RBD_PG_NUM:-${RBD_PG_NUM_DEFAULT}}}"
 CLUSTER_NETWORK="${CLUSTER_NETWORK:-${_CONF_CLUSTER_NETWORK:-}}"
 DASHBOARD_PASSWORD="${DASHBOARD_PASSWORD:-${_CONF_DASHBOARD_PASSWORD:-}}"
 OSD_ALLOW_ALL="${OSD_ALLOW_ALL:-${_CONF_OSD_ALLOW_ALL:-0}}"
+SKIP_MONITORING_STACK="${SKIP_MONITORING_STACK:-${_CONF_SKIP_MONITORING_STACK:-0}}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -79,6 +82,79 @@ err()  { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 
 need_root() {
   [[ $EUID -eq 0 ]] || err "请使用 root 执行：sudo bash $0 $*"
+}
+
+# 本脚本实际会拉的镜像（不含 cephadm list-images 里未启用的 ingress/jaeger 等）
+default_ceph_image() {
+  if [[ -n "${CEPH_IMAGE}" ]]; then
+    printf '%s' "${CEPH_IMAGE}"
+    return
+  fi
+  case "${CEPH_RELEASE}" in
+    squid) printf '%s' "quay.io/ceph/ceph:v19" ;;
+    *)     printf '%s' "quay.io/ceph/ceph:v18" ;;
+  esac
+}
+
+list_deploy_images() {
+  default_ceph_image
+  echo
+  if [[ "${SKIP_MONITORING_STACK}" != "1" ]]; then
+    case "${CEPH_RELEASE}" in
+      squid)
+        echo "quay.io/prometheus/prometheus:v2.51.0"
+        echo "quay.io/prometheus/alertmanager:v0.27.0"
+        echo "quay.io/prometheus/node-exporter:v1.7.0"
+        echo "quay.io/ceph/ceph-grafana:9.4.7"
+        ;;
+      *)
+        echo "quay.io/prometheus/prometheus:v2.43.0"
+        echo "quay.io/prometheus/alertmanager:v0.25.0"
+        echo "quay.io/prometheus/node-exporter:v1.5.0"
+        echo "quay.io/ceph/ceph-grafana:9.4.7"
+        ;;
+    esac
+  fi
+}
+
+image_pull_status() {
+  local img="$1"
+  if command -v docker >/dev/null 2>&1 && docker image inspect "${img}" >/dev/null 2>&1; then
+    echo "已有"
+  else
+    echo "未拉取"
+  fi
+}
+
+print_image_list() {
+  local img n=0
+  echo
+  log "当前部署需要的镜像  CEPH_RELEASE=${CEPH_RELEASE}  SKIP_MONITORING_STACK=${SKIP_MONITORING_STACK}"
+  if [[ -n "${CEPH_IMAGE}" ]]; then
+    echo "  CEPH_IMAGE=${CEPH_IMAGE}（conf 覆盖默认 quay.io/ceph/ceph）"
+  fi
+  printf "  %-8s  %s\n" "状态" "镜像"
+  while IFS= read -r img; do
+    [[ -n "${img}" ]] || continue
+    n=$((n + 1))
+    printf "  %-8s  %s\n" "$(image_pull_status "${img}")" "${img}"
+  done < <(list_deploy_images)
+  echo
+  echo "  说明: 第 1 个镜像每台节点都要有（MON/MGR/OSD 共用）。"
+  if [[ "${SKIP_MONITORING_STACK}" != "1" ]]; then
+    echo "        其余为 cephadm 自带监控栈（Prometheus/Grafana 等），bootstrap 时拉取。"
+    echo "        已有业务监控可在 conf 设 SKIP_MONITORING_STACK=1 跳过。"
+  else
+    echo "        已跳过 cephadm 监控栈，只拉 Ceph 主镜像。"
+  fi
+  echo "  单独打印: bash $(basename "$0") images"
+  echo
+}
+
+cmd_images() {
+  print_image_list
+  echo "---- 纯镜像列表（可复制）----"
+  list_deploy_images
 }
 
 SSH_OPTS=(
@@ -221,6 +297,7 @@ install_ceph_repo() {
 do_prepare() {
   need_root prepare
   export DEBIAN_FRONTEND=noninteractive
+  print_image_list
   maybe_set_hostname
   apply_hosts
 
@@ -234,10 +311,10 @@ do_prepare() {
   install_ceph_repo
   apt-get install -y cephadm ceph-common
 
-  if [[ -n "${CEPH_IMAGE}" ]]; then
-    log "预拉 Ceph 镜像 ${CEPH_IMAGE}"
-    docker pull "${CEPH_IMAGE}" || warn "镜像预拉失败，bootstrap 时再试"
-  fi
+  local img
+  img="$(default_ceph_image)"
+  log "预拉 Ceph 主镜像 ${img}"
+  docker pull "${img}" || warn "镜像预拉失败，bootstrap 时再试"
 
   timedatectl set-ntp true || true
   log "prepare 完成：$(hostname) $(hostname -I | awk '{print $1}')"
@@ -300,6 +377,7 @@ _remote_cmd() {
 cmd_prepare_all() {
   need_root prepare-all
   ensure_sshpass
+  print_image_list
   _wrap_prepare() { _remote_cmd prepare "$@"; }
   for_each_node _wrap_prepare
 }
@@ -426,6 +504,8 @@ cmd_bootstrap() {
   [[ -n "${bip}" ]] || err "节点表需要一行 role=bootstrap"
   is_local_ip "${bip}" || err "bootstrap 必须在 ${bhost} (${bip}) 上执行"
 
+  print_image_list
+
   if [[ -f /etc/ceph/ceph.conf ]] && run_ceph -s >/dev/null 2>&1; then
     log "集群已存在，跳过 bootstrap（ceph -s 可用）"
     run_ceph -s
@@ -439,6 +519,9 @@ cmd_bootstrap() {
   [[ -n "${CEPH_IMAGE}" ]] && args+=(--image "${CEPH_IMAGE}")
   if [[ -n "${DASHBOARD_PASSWORD}" ]]; then
     args+=(--initial-dashboard-password "${DASHBOARD_PASSWORD}" --dashboard-password-noupdate)
+  fi
+  if [[ "${SKIP_MONITORING_STACK}" == "1" ]]; then
+    args+=(--skip-monitoring-stack)
   fi
 
   log "cephadm ${args[*]}"
@@ -608,7 +691,9 @@ cmd_help() {
 
 用法  sudo bash ${bin} <命令>
 
-  prepare        本机：docker、chrony、lvm2、cephadm
+  prepare        本机：docker、chrony、lvm2、cephadm（开始时打印镜像列表）
+  prepare-all    管理机：对 conf 全部节点执行 prepare
+  images         打印当前部署需要的 Docker 镜像（不需要 root）
   prepare-all    管理机：对 conf 全部节点执行 prepare
   hosts          本机写入 /etc/hosts
   hosts-all      全部节点刷新 hosts
@@ -635,6 +720,7 @@ main() {
   shift || true
   case "${cmd}" in
     -h|--help|help) cmd_help ;;
+    images)         cmd_images ;;
     prepare)        cmd_prepare "$@" ;;
     prepare-all)    cmd_prepare_all "$@" ;;
     hosts)          cmd_hosts "$@" ;;
