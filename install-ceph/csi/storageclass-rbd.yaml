@@ -1,0 +1,21 @@
+# 在业务 Kubernetes 上应用（先装 Ceph CSI，并填好 Secret / ConfigMap）
+# 动态供给 RBD，适合 Postgres 等块设备负载
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ceph-rbd
+provisioner: rbd.csi.ceph.com
+parameters:
+  clusterID: ceph
+  pool: kubernetes
+  imageFeatures: layering
+  csi.storage.k8s.io/provisioner-secret-name: csi-rbd-secret
+  csi.storage.k8s.io/provisioner-secret-namespace: ceph-csi
+  csi.storage.k8s.io/controller-expand-secret-name: csi-rbd-secret
+  csi.storage.k8s.io/controller-expand-secret-namespace: ceph-csi
+  csi.storage.k8s.io/node-stage-secret-name: csi-rbd-secret
+  csi.storage.k8s.io/node-stage-secret-namespace: ceph-csi
+  csi.storage.k8s.io/fstype: ext4
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: Immediate
