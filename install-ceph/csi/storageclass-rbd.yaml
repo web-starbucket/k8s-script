@@ -1,5 +1,4 @@
-# 在业务 Kubernetes 上应用（先装 Ceph CSI，并填好 Secret / ConfigMap）
-# 动态供给 RBD，适合 Postgres 等块设备负载
+# 业务集群：先装 Ceph CSI，再 apply Secret/ConfigMap
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:

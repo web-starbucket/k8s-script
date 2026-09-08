@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Ubuntu 24 + cephadm 独立 Ceph 集群（RBD），与业务 Kubernetes 分开部署
 # 用法: bash install-ceph.sh --help
 
 set -euo pipefail
@@ -8,12 +7,31 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CEPH_NODES_FILE="${CEPH_NODES_FILE:-${SCRIPT_DIR}/ceph-nodes.conf}"
 REMOTE_DIR="/opt/service/ceph"
 
-CEPH_RELEASE_DEFAULT="reef"
+BOLD='\033[1m'
+DIM='\033[2m'
+CYAN='\033[0;36m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+step() { echo; echo -e "${CYAN}${BOLD}▸${NC} ${BOLD}$*${NC}"; }
+item() { echo -e "  ${DIM}·${NC} $*"; }
+ok()   { echo -e "  ${GREEN}✓${NC} $*"; }
+fail() { echo -e "  ${RED}✗${NC} $*" >&2; }
+skip() { echo -e "  ${DIM}–${NC} $*"; }
+log()  { item "$@"; }
+warn() { echo -e "  ${YELLOW}!${NC} $*"; }
+err()  { echo -e "${RED}✗${NC} $*" >&2; exit 1; }
+sum()  { echo -e "${DIM}──${NC} $*"; echo; }
+
+CEPH_RELEASE_DEFAULT="tentacle"
 RBD_POOL_DEFAULT="kubernetes"
 RBD_PG_NUM_DEFAULT="32"
 
 _CONF_CEPH_RELEASE=""
 _CONF_CEPH_APT_MIRROR=""
+_CONF_IMAGE_MIRROR=""
 _CONF_CEPH_IMAGE=""
 _CONF_RBD_POOL=""
 _CONF_RBD_PG_NUM=""
@@ -45,6 +63,7 @@ load_conf_kv() {
     case "${key}" in
       CEPH_RELEASE) _CONF_CEPH_RELEASE="${val}" ;;
       CEPH_APT_MIRROR) _CONF_CEPH_APT_MIRROR="${val}" ;;
+      IMAGE_MIRROR) _CONF_IMAGE_MIRROR="${val}" ;;
       CEPH_IMAGE) _CONF_CEPH_IMAGE="${val}" ;;
       RBD_POOL) _CONF_RBD_POOL="${val}" ;;
       RBD_PG_NUM) _CONF_RBD_PG_NUM="${val}" ;;
@@ -56,14 +75,14 @@ load_conf_kv() {
   done <"${f}"
 }
 
-[[ -f "${CEPH_NODES_FILE}" ]] || {
-  echo -e "\033[0;31m[ERROR]\033[0m 缺少 ${CEPH_NODES_FILE}" >&2
-  exit 1
-}
+[[ -f "${CEPH_NODES_FILE}" ]] || err "缺少配置 ${CEPH_NODES_FILE}"
 load_conf_kv "${CEPH_NODES_FILE}"
 
 CEPH_RELEASE="${CEPH_RELEASE:-${_CONF_CEPH_RELEASE:-${CEPH_RELEASE_DEFAULT}}}"
+CEPH_RELEASE="$(printf '%s' "${CEPH_RELEASE}" | tr 'A-Z' 'a-z')"
 CEPH_APT_MIRROR="${CEPH_APT_MIRROR:-${_CONF_CEPH_APT_MIRROR:-}}"
+IMAGE_MIRROR="${IMAGE_MIRROR:-${_CONF_IMAGE_MIRROR:-}}"
+IMAGE_MIRROR="${IMAGE_MIRROR%/}"
 CEPH_IMAGE="${CEPH_IMAGE:-${_CONF_CEPH_IMAGE:-}}"
 RBD_POOL="${RBD_POOL:-${_CONF_RBD_POOL:-${RBD_POOL_DEFAULT}}}"
 RBD_PG_NUM="${RBD_PG_NUM:-${_CONF_RBD_PG_NUM:-${RBD_PG_NUM_DEFAULT}}}"
@@ -72,27 +91,69 @@ DASHBOARD_PASSWORD="${DASHBOARD_PASSWORD:-${_CONF_DASHBOARD_PASSWORD:-}}"
 OSD_ALLOW_ALL="${OSD_ALLOW_ALL:-${_CONF_OSD_ALLOW_ALL:-0}}"
 SKIP_MONITORING_STACK="${SKIP_MONITORING_STACK:-${_CONF_SKIP_MONITORING_STACK:-0}}"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
-log()  { echo -e "${GREEN}[INFO]${NC} $*"; }
-warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
-err()  { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
+if [[ -n "${CEPH_APT_MIRROR}" && "${CEPH_APT_MIRROR}" != http://* && "${CEPH_APT_MIRROR}" != https://* ]]; then
+  if [[ -z "${IMAGE_MIRROR}" ]]; then
+    IMAGE_MIRROR="${CEPH_APT_MIRROR%/}"
+    warn "CEPH_APT_MIRROR 不是 http(s)，已当作 IMAGE_MIRROR=${IMAGE_MIRROR}"
+  else
+    warn "CEPH_APT_MIRROR 无效，已忽略（容器走 IMAGE_MIRROR）"
+  fi
+  CEPH_APT_MIRROR=""
+fi
 
 need_root() {
-  [[ $EUID -eq 0 ]] || err "请使用 root 执行：sudo bash $0 $*"
+  [[ $EUID -eq 0 ]] || err "请用 root：sudo bash $0 $*"
 }
 
-# 本脚本实际会拉的镜像（不含 cephadm list-images 里未启用的 ingress/jaeger 等）
+mirror_image() {
+  local img="$1"
+  if [[ -z "${IMAGE_MIRROR}" ]]; then
+    printf '%s' "${img}"
+    return
+  fi
+  case "${img}" in
+    "${IMAGE_MIRROR}/"*) printf '%s' "${img}" ;;
+    *) printf '%s/%s' "${IMAGE_MIRROR}" "${img}" ;;
+  esac
+}
+
+official_ceph_image() {
+  case "${CEPH_RELEASE}" in
+    tentacle) printf '%s' "quay.io/ceph/ceph:v20" ;;
+    squid)    printf '%s' "quay.io/ceph/ceph:v19" ;;
+    reef)     printf '%s' "quay.io/ceph/ceph:v18" ;;
+    *)        printf '%s' "quay.io/ceph/ceph:v20" ;;
+  esac
+}
+
 default_ceph_image() {
   if [[ -n "${CEPH_IMAGE}" ]]; then
     printf '%s' "${CEPH_IMAGE}"
     return
   fi
+  mirror_image "$(official_ceph_image)"
+}
+
+list_official_monitor_images() {
   case "${CEPH_RELEASE}" in
-    squid) printf '%s' "quay.io/ceph/ceph:v19" ;;
-    *)     printf '%s' "quay.io/ceph/ceph:v18" ;;
+    squid)
+      echo "quay.io/prometheus/prometheus:v2.51.0"
+      echo "quay.io/prometheus/alertmanager:v0.27.0"
+      echo "quay.io/prometheus/node-exporter:v1.7.0"
+      echo "quay.io/ceph/ceph-grafana:9.4.7"
+      ;;
+    reef)
+      echo "quay.io/prometheus/prometheus:v2.43.0"
+      echo "quay.io/prometheus/alertmanager:v0.25.0"
+      echo "quay.io/prometheus/node-exporter:v1.5.0"
+      echo "quay.io/ceph/ceph-grafana:9.4.7"
+      ;;
+    *)
+      echo "quay.io/prometheus/prometheus:v3.6.0"
+      echo "quay.io/prometheus/alertmanager:v0.28.1"
+      echo "quay.io/prometheus/node-exporter:v1.9.1"
+      echo "quay.io/ceph/grafana:12.3.1"
+      ;;
   esac
 }
 
@@ -100,20 +161,12 @@ list_deploy_images() {
   default_ceph_image
   echo
   if [[ "${SKIP_MONITORING_STACK}" != "1" ]]; then
-    case "${CEPH_RELEASE}" in
-      squid)
-        echo "quay.io/prometheus/prometheus:v2.51.0"
-        echo "quay.io/prometheus/alertmanager:v0.27.0"
-        echo "quay.io/prometheus/node-exporter:v1.7.0"
-        echo "quay.io/ceph/ceph-grafana:9.4.7"
-        ;;
-      *)
-        echo "quay.io/prometheus/prometheus:v2.43.0"
-        echo "quay.io/prometheus/alertmanager:v0.25.0"
-        echo "quay.io/prometheus/node-exporter:v1.5.0"
-        echo "quay.io/ceph/ceph-grafana:9.4.7"
-        ;;
-    esac
+    local img
+    while IFS= read -r img; do
+      [[ -n "${img}" ]] || continue
+      mirror_image "${img}"
+      echo
+    done < <(list_official_monitor_images)
   fi
 }
 
@@ -127,33 +180,24 @@ image_pull_status() {
 }
 
 print_image_list() {
-  local img n=0
-  echo
-  log "当前部署需要的镜像  CEPH_RELEASE=${CEPH_RELEASE}  SKIP_MONITORING_STACK=${SKIP_MONITORING_STACK}"
-  if [[ -n "${CEPH_IMAGE}" ]]; then
-    echo "  CEPH_IMAGE=${CEPH_IMAGE}（conf 覆盖默认 quay.io/ceph/ceph）"
-  fi
-  printf "  %-8s  %s\n" "状态" "镜像"
+  local img st
+  step "镜像  ${CEPH_RELEASE}"
+  [[ -n "${IMAGE_MIRROR}" ]] && item "仓库  ${IMAGE_MIRROR}" || item "仓库  quay.io（官方）"
+  [[ -n "${CEPH_IMAGE}" ]] && item "主镜像覆盖  ${CEPH_IMAGE}"
   while IFS= read -r img; do
     [[ -n "${img}" ]] || continue
-    n=$((n + 1))
-    printf "  %-8s  %s\n" "$(image_pull_status "${img}")" "${img}"
+    st="$(image_pull_status "${img}")"
+    if [[ "${st}" == "已有" ]]; then
+      ok "${img}"
+    else
+      item "${img}"
+    fi
   done < <(list_deploy_images)
-  echo
-  echo "  说明: 第 1 个镜像每台节点都要有（MON/MGR/OSD 共用）。"
-  if [[ "${SKIP_MONITORING_STACK}" != "1" ]]; then
-    echo "        其余为 cephadm 自带监控栈（Prometheus/Grafana 等），bootstrap 时拉取。"
-    echo "        已有业务监控可在 conf 设 SKIP_MONITORING_STACK=1 跳过。"
-  else
-    echo "        已跳过 cephadm 监控栈，只拉 Ceph 主镜像。"
-  fi
-  echo "  单独打印: bash $(basename "$0") images"
-  echo
 }
 
 cmd_images() {
   print_image_list
-  echo "---- 纯镜像列表（可复制）----"
+  echo
   list_deploy_images
 }
 
@@ -184,7 +228,6 @@ list_node_lines() {
 
 list_ssh_nodes() { list_node_lines; }
 
-# 从 ceph-nodes.conf 生成 CSI monitors YAML 行（IP:6789）
 csi_monitors_yaml() {
   list_node_lines | awk -F'|' '
     {
@@ -211,8 +254,7 @@ write_csi_secret_yaml() {
   [[ -n "${mons}" ]] || err "ceph-nodes.conf 没有节点 IP，无法生成 CSI monitors"
   mkdir -p "$(dirname "${dest}")"
   cat >"${dest}" <<EOF
-# monitors 由 install-ceph.sh 按 ceph-nodes.conf 生成，勿手改 IP
-# 真实 userKey：sudo bash install-ceph.sh export-rbd → csi/generated/secret.yaml
+# monitors 来自 ceph-nodes.conf；密钥用 export-rbd
 apiVersion: v1
 kind: Secret
 metadata:
@@ -244,18 +286,18 @@ sync_csi_example_from_conf() {
   write_csi_secret_yaml \
     "${SCRIPT_DIR}/csi/secret.yaml.example" \
     "REPLACE_WITH_ceph_auth_get-key_client.kubernetes"
-  log "已按 ${CEPH_NODES_FILE} 更新 ${SCRIPT_DIR}/csi/secret.yaml.example （monitors）"
+  ok "csi/secret.yaml.example  monitors 已按 conf 更新"
 }
 
 cmd_csi_example() {
+  step "csi-example"
   sync_csi_example_from_conf
-  echo
   awk '/"monitors"/, /\]/' "${SCRIPT_DIR}/csi/secret.yaml.example" || true
 }
 
 ensure_sshpass() {
   command -v sshpass >/dev/null 2>&1 && return 0
-  log "安装 sshpass"
+  item "安装 sshpass"
   apt-get update -y >/dev/null
   apt-get install -y sshpass
 }
@@ -340,7 +382,7 @@ maybe_set_hostname() {
   fi
   [[ -n "${host}" ]] || return 0
   if [[ "$(hostname)" != "${host}" ]]; then
-    log "设置主机名 ${host}"
+    item "主机名 → ${host}"
     hostnamectl set-hostname "${host}"
   fi
 }
@@ -366,11 +408,10 @@ install_ceph_repo() {
 do_prepare() {
   need_root prepare
   export DEBIAN_FRONTEND=noninteractive
-  print_image_list
+  step "prepare  $(hostname)"
   maybe_set_hostname
   apply_hosts
-
-  log "安装基础包（chrony / lvm2 / docker / cephadm）"
+  item "安装 docker / chrony / cephadm"
   apt-get update -y
   apt-get install -y ca-certificates curl gnupg lvm2 chrony docker.io
 
@@ -382,21 +423,21 @@ do_prepare() {
 
   local img
   img="$(default_ceph_image)"
-  log "预拉 Ceph 主镜像 ${img}"
-  docker pull "${img}" || warn "镜像预拉失败，bootstrap 时再试"
+  item "拉取 ${img}"
+  docker pull "${img}" || warn "预拉失败，bootstrap 时再试"
 
   timedatectl set-ntp true || true
-  log "prepare 完成：$(hostname) $(hostname -I | awk '{print $1}')"
+  ok "$(hostname)  $(hostname -I | awk '{print $1}')"
 }
 
 cmd_prepare() { do_prepare; }
 
 cmd_hosts() {
   need_root hosts
+  step "hosts"
   maybe_set_hostname
   apply_hosts
-  log "已写入 /etc/hosts"
-  grep -A20 'ceph-cluster BEGIN' /etc/hosts || true
+  ok "/etc/hosts 已写入 Ceph 节点"
 }
 
 sync_install_to_node() {
@@ -420,23 +461,23 @@ for_each_node() {
       n_fail=$((n_fail + 1))
     fi
   done < <(list_ssh_nodes)
-  log "结束：成功=${n_ok} 失败=${n_fail}"
+  sum "成功 ${n_ok}    失败 ${n_fail}"
   [[ "${n_fail}" -eq 0 ]]
 }
 
 _remote_cmd() {
   local cmd="$1" ip="$2" host="$3" role="$4" user="$5" pass="$6"
-  log "======== ${user}@${ip} (${host}) [${role}] ========"
+  item "${host}  ${ip}  [${role}]"
   if is_local_ip "${ip}"; then
     bash "${SCRIPT_DIR}/install-ceph.sh" "${cmd}"
     return $?
   fi
   if [[ -z "${pass}" ]] && ! ssh -n -o BatchMode=yes -o ConnectTimeout=5 "${user}@${ip}" "true" 2>/dev/null; then
-    warn "跳过 ${ip}：无密码且无法免密 SSH（请先 ssh-keys）"
+    fail "${ip}  无法 SSH，先跑 ssh-keys"
     return 1
   fi
   if placeholder_pass "${pass}"; then
-    warn "${ip} 密码仍是占位符，请改 ceph-nodes.conf"
+    fail "${ip}  请改 conf 里的真实密码"
     return 1
   fi
   sync_install_to_node "${user}" "${ip}" "${pass}" || return 1
@@ -446,6 +487,7 @@ _remote_cmd() {
 cmd_prepare_all() {
   need_root prepare-all
   ensure_sshpass
+  step "prepare-all"
   print_image_list
   _wrap_prepare() { _remote_cmd prepare "$@"; }
   for_each_node _wrap_prepare
@@ -454,6 +496,7 @@ cmd_prepare_all() {
 cmd_hosts_all() {
   need_root hosts-all
   ensure_sshpass
+  step "hosts-all"
   _wrap_hosts() { _remote_cmd hosts "$@"; }
   for_each_node _wrap_hosts
   sync_csi_example_from_conf
@@ -462,10 +505,11 @@ cmd_hosts_all() {
 cmd_ssh_keys() {
   need_root ssh-keys
   ensure_sshpass
+  step "ssh-keys"
   mkdir -p /root/.ssh
   chmod 700 /root/.ssh
   if [[ ! -f /root/.ssh/id_rsa ]]; then
-    log "生成本机 root RSA 密钥"
+    item "生成本机 RSA 密钥"
     ssh-keygen -t rsa -b 4096 -N "" -f /root/.ssh/id_rsa -C "ceph-root@$(hostname)"
   fi
   chmod 600 /root/.ssh/id_rsa
@@ -476,32 +520,34 @@ cmd_ssh_keys() {
   pub="$(cat /root/.ssh/id_rsa.pub)"
   grep -qxF "${pub}" /root/.ssh/authorized_keys || echo "${pub}" >>/root/.ssh/authorized_keys
 
-  local count ip host role user pass errf
+  local count ip host role user pass errf n_ok=0 n_fail=0
   count="$(node_count)"
   [[ "${count}" -ge 1 ]] || err "节点表为空"
   errf="$(mktemp)"
-  log "向 ${count} 台节点分发公钥"
+  item "分发公钥  ${count} 台"
   while IFS='|' read -r ip host role user pass disks || [[ -n "${ip:-}" ]]; do
     [[ -n "${ip}" ]] || continue
     pass="$(printf '%s' "${pass:-}" | sed 's/\r$//;s/^[[:space:]]*//;s/[[:space:]]*$//')"
     if is_local_ip "${ip}"; then
-      log "跳过本机 ${ip}"
+      skip "本机  ${host}"
       continue
     fi
     if [[ -z "${pass}" ]] || placeholder_pass "${pass}"; then
-      warn "${ip} 未填真实密码，跳过"
+      fail "${host}  ${ip}  未填真实密码"
+      n_fail=$((n_fail + 1))
       continue
     fi
-    log "ssh-copy-id ${user}@${ip} (${host})"
     : >"${errf}"
     if SSHPASS="${pass}" sshpass -e ssh-copy-id -i /root/.ssh/id_rsa.pub \
       -o StrictHostKeyChecking=no \
       -o PreferredAuthentications=password \
       -o PubkeyAuthentication=no \
       "${user}@${ip}" </dev/null >/dev/null 2>"${errf}"; then
-      log "  OK ${ip}"
+      ok "${host}  ${ip}"
+      n_ok=$((n_ok + 1))
     else
-      warn "  FAIL ${ip}: $(tr '\n' ' ' <"${errf}" | cut -c1-180)"
+      fail "${host}  ${ip}  $(tr '\n' ' ' <"${errf}" | cut -c1-80)"
+      n_fail=$((n_fail + 1))
     fi
     SSHPASS="${pass}" sshpass -e ssh -n "${SSH_OPTS[@]}" \
       "${user}@${ip}" \
@@ -510,7 +556,7 @@ cmd_ssh_keys() {
   done < <(list_ssh_nodes)
   rm -f "${errf}"
 
-  log "合并各节点公钥（互通免密）"
+  item "节点互免密"
   local tmp_bundle merge_sh
   tmp_bundle="$(mktemp)"
   merge_sh="$(mktemp)"
@@ -547,15 +593,17 @@ EOS
   while IFS='|' read -r ip host role user pass disks; do
     [[ -n "${ip}" ]] || continue
     is_local_ip "${ip}" && continue
-    scp "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 \
+    if scp "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 \
       "${tmp_bundle}" "${user}@${ip}:/tmp/ceph_authorized_bundle" </dev/null 2>/dev/null \
       && scp "${SSH_OPTS[@]}" -o BatchMode=yes "${merge_sh}" "${user}@${ip}:/tmp/ceph_merge_keys.sh" </dev/null 2>/dev/null \
-      && ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes "${user}@${ip}" "bash /tmp/ceph_merge_keys.sh; rm -f /tmp/ceph_merge_keys.sh" \
-      && log "已合并密钥到 ${ip}" \
-      || warn "合并密钥到 ${ip} 失败"
+      && ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes "${user}@${ip}" "bash /tmp/ceph_merge_keys.sh; rm -f /tmp/ceph_merge_keys.sh"; then
+      ok "互通  ${host}"
+    else
+      fail "互通  ${host}"
+    fi
   done < <(list_ssh_nodes)
   rm -f "${tmp_bundle}" "${merge_sh}"
-  log "ssh-keys 完成"
+  sum "公钥 成功 ${n_ok}    失败 ${n_fail}"
 }
 
 run_ceph() {
@@ -572,53 +620,75 @@ cmd_bootstrap() {
   bip="$(bootstrap_ip)"
   bhost="$(bootstrap_host)"
   [[ -n "${bip}" ]] || err "节点表需要一行 role=bootstrap"
-  is_local_ip "${bip}" || err "bootstrap 必须在 ${bhost} (${bip}) 上执行"
+  is_local_ip "${bip}" || err "请在 ${bhost} (${bip}) 上执行 bootstrap"
 
+  step "bootstrap  ${bhost}  ${bip}"
   print_image_list
 
   if [[ -f /etc/ceph/ceph.conf ]] && run_ceph -s >/dev/null 2>&1; then
-    log "集群已存在，跳过 bootstrap（ceph -s 可用）"
+    ok "集群已存在，跳过"
     run_ceph -s
     return 0
   fi
 
-  [[ "$(node_count)" -ge 3 ]] || warn "节点不足 3 台，MON 法定人数与三副本 RBD 都不完整"
+  [[ "$(node_count)" -ge 3 ]] || warn "节点不足 3 台，三副本 / MON 法定人数不完整"
 
-  local args=(bootstrap --mon-ip "${bip}" --ssh-user root --allow-fqdn-hostname)
+  local ceph_img cfg_tmp=""
+  ceph_img="$(default_ceph_image)"
+  local args=(bootstrap --mon-ip "${bip}" --ssh-user root --allow-fqdn-hostname --image "${ceph_img}")
   [[ -n "${CLUSTER_NETWORK}" ]] && args+=(--cluster-network "${CLUSTER_NETWORK}")
-  [[ -n "${CEPH_IMAGE}" ]] && args+=(--image "${CEPH_IMAGE}")
   if [[ -n "${DASHBOARD_PASSWORD}" ]]; then
     args+=(--initial-dashboard-password "${DASHBOARD_PASSWORD}" --dashboard-password-noupdate)
   fi
   if [[ "${SKIP_MONITORING_STACK}" == "1" ]]; then
     args+=(--skip-monitoring-stack)
+  elif [[ -n "${IMAGE_MIRROR}" ]]; then
+    cfg_tmp="$(mktemp)"
+    {
+      echo "# generated by install-ceph.sh IMAGE_MIRROR=${IMAGE_MIRROR}"
+      echo "[mgr]"
+      echo "mgr/cephadm/container_image_prometheus = $(mirror_image "$(list_official_monitor_images | sed -n '1p')")"
+      echo "mgr/cephadm/container_image_alertmanager = $(mirror_image "$(list_official_monitor_images | sed -n '2p')")"
+      echo "mgr/cephadm/container_image_node_exporter = $(mirror_image "$(list_official_monitor_images | sed -n '3p')")"
+      echo "mgr/cephadm/container_image_grafana = $(mirror_image "$(list_official_monitor_images | sed -n '4p')")"
+    } >"${cfg_tmp}"
+    args+=(--config "${cfg_tmp}")
   fi
 
-  log "cephadm ${args[*]}"
-  cephadm "${args[@]}"
+  item "cephadm bootstrap  --image ${ceph_img}"
+  if cephadm "${args[@]}"; then
+    :
+  else
+    [[ -n "${cfg_tmp}" ]] && rm -f "${cfg_tmp}"
+    err "bootstrap 失败"
+  fi
+  [[ -n "${cfg_tmp}" ]] && rm -f "${cfg_tmp}"
 
   cephadm install ceph-common || true
   mkdir -p /root/.ceph
   chmod 700 /etc/ceph
-  log "bootstrap 完成"
+  ok "集群已创建"
+  ok "Dashboard  https://${bip}:8443  admin"
+  item "密码见 bootstrap 输出，或: ceph dashboard ac-user-show admin"
   run_ceph -s || true
-  echo
-  log "Dashboard: https://${bip}:8443  （用户 admin）"
-  echo "查看密码: ceph dashboard ac-user-show admin  或 bootstrap 日志"
 }
 
 cmd_add_hosts() {
   need_root add-hosts
   [[ -f /etc/ceph/ceph.conf ]] || err "请先在 bootstrap 节点执行 bootstrap"
+  step "add-hosts"
   local ip host role user pass disks
   while IFS='|' read -r ip host role user pass disks; do
     [[ -n "${ip}" ]] || continue
     if [[ "$(echo "${role}" | tr 'A-Z' 'a-z')" == "bootstrap" ]]; then
-      log "bootstrap 节点已在集群中: ${host}"
+      skip "${host}  已是 bootstrap"
       continue
     fi
-    log "ceph orch host add ${host} ${ip}"
-    run_ceph orch host add "${host}" "${ip}" || warn "host add ${host} 失败（可能已存在）"
+    if run_ceph orch host add "${host}" "${ip}"; then
+      ok "${host}  ${ip}"
+    else
+      warn "${host}  加入失败（可能已在集群中）"
+    fi
   done < <(list_ssh_nodes)
   run_ceph orch host ls
   sync_csi_example_from_conf
@@ -627,6 +697,7 @@ cmd_add_hosts() {
 cmd_osd() {
   need_root osd
   [[ -f /etc/ceph/ceph.conf ]] || err "请先 bootstrap"
+  step "osd"
   local use_all=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -636,8 +707,8 @@ cmd_osd() {
   done
 
   if [[ "${use_all}" == "1" ]]; then
-    [[ "${OSD_ALLOW_ALL}" == "1" ]] || err "使用全部空闲盘须在 conf 设 OSD_ALLOW_ALL=1，且确认盘上无数据"
-    warn "将领取所有未用块设备做 OSD（不可逆）"
+    [[ "${OSD_ALLOW_ALL}" == "1" ]] || err "须在 conf 设 OSD_ALLOW_ALL=1，且盘上无数据"
+    warn "将清空所有空闲块设备做 OSD"
     run_ceph orch apply osd --all-available-devices
     run_ceph osd tree
     return 0
@@ -647,13 +718,16 @@ cmd_osd() {
   while IFS='|' read -r ip host role user pass disks; do
     [[ -n "${ip}" ]] || continue
     disks="$(printf '%s' "${disks:-}" | sed 's/\r$//;s/^[[:space:]]*//;s/[[:space:]]*$//')"
-    [[ -n "${disks}" ]] || { log "${host} 未配置 OSD 盘，跳过"; continue; }
+    [[ -n "${disks}" ]] || { skip "${host}  未配 OSD 盘"; continue; }
     IFS=',' read -ra _devs <<<"${disks}"
     for d in "${_devs[@]}"; do
       d="$(printf '%s' "${d}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
       [[ -n "${d}" ]] || continue
-      log "OSD ${host}:${d}"
-      run_ceph orch daemon add osd "${host}:${d}" || warn "${host}:${d} 失败（设备已占用或路径不对）"
+      if run_ceph orch daemon add osd "${host}:${d}"; then
+        ok "${host}:${d}"
+      else
+        fail "${host}:${d}  盘占用或路径不对"
+      fi
     done
   done < <(list_ssh_nodes)
   sleep 3
@@ -664,35 +738,37 @@ cmd_osd() {
 cmd_pool() {
   need_root pool
   [[ -f /etc/ceph/ceph.conf ]] || err "请先 bootstrap"
+  step "pool  ${RBD_POOL}"
   if run_ceph osd pool ls | grep -qx "${RBD_POOL}"; then
-    log "池 ${RBD_POOL} 已存在"
+    skip "池已存在"
   else
-    log "创建 RBD 池 ${RBD_POOL} pg=${RBD_PG_NUM}"
+    item "创建  pg=${RBD_PG_NUM}  size=3"
     run_ceph osd pool create "${RBD_POOL}" "${RBD_PG_NUM}"
     run_ceph osd pool application enable "${RBD_POOL}" rbd
     run_ceph osd pool set "${RBD_POOL}" size 3 || true
     run_ceph osd pool set "${RBD_POOL}" min_size 2 || true
+    ok "池 ${RBD_POOL}"
   fi
-  # rbd pool init
   if command -v rbd >/dev/null 2>&1; then
     rbd pool init "${RBD_POOL}" || true
   else
     cephadm shell -- rbd pool init "${RBD_POOL}" || true
   fi
   if run_ceph auth get client.kubernetes >/dev/null 2>&1; then
-    log "client.kubernetes 已存在"
+    skip "client.kubernetes 已存在"
   else
-    log "创建 client.kubernetes（CSI 用）"
+    item "创建 client.kubernetes"
     run_ceph auth get-or-create client.kubernetes \
       mon "profile rbd" \
       osd "profile rbd pool=${RBD_POOL}" \
       mgr "profile rbd pool=${RBD_POOL}"
+    ok "client.kubernetes"
   fi
-  run_ceph osd pool ls detail | grep -A6 "pool '${RBD_POOL}'" || run_ceph osd lspools
   sync_csi_example_from_conf
 }
 
 cmd_status() {
+  step "status  ${CEPH_RELEASE}  池 ${RBD_POOL}"
   if [[ -f /etc/ceph/ceph.conf ]]; then
     run_ceph -s
     echo
@@ -700,16 +776,16 @@ cmd_status() {
     echo
     run_ceph osd tree || true
   else
-    warn "本机无 /etc/ceph/ceph.conf，仅打印节点表"
+    warn "本机无 ceph.conf，只列节点表"
   fi
   echo
-  log "节点表 ${CEPH_NODES_FILE}  release=${CEPH_RELEASE}  pool=${RBD_POOL}"
-  list_node_lines | awk -F'|' '{printf "  %s  %s  [%s]  osd=%s\n", $1, $2, $3, $6}'
+  list_node_lines | awk -F'|' '{printf "  ·  %s  %s  [%s]  %s\n", $2, $1, $3, $6}'
 }
 
 cmd_export_rbd() {
   need_root export-rbd
   [[ -f /etc/ceph/ceph.conf ]] || err "请先 bootstrap / pool"
+  step "export-rbd"
   local out key
   out="${SCRIPT_DIR}/csi/generated"
   mkdir -p "${out}"
@@ -718,11 +794,9 @@ cmd_export_rbd() {
   sync_csi_example_from_conf
   write_csi_secret_yaml "${out}/secret.yaml" "${key}"
   chmod 600 "${out}/secret.yaml"
-  log "已写入 ${out}/secret.yaml （含密钥，勿提交 git；monitors 来自 ceph-nodes.conf）"
-  echo "业务集群："
-  echo "  1. Helm 安装 ceph-csi RBD（namespace ceph-csi）"
-  echo "  2. kubectl apply -f ${out}/secret.yaml"
-  echo "  3. kubectl apply -f ${SCRIPT_DIR}/csi/storageclass-rbd.yaml"
+  ok "${out}/secret.yaml  （含密钥，勿提交 git）"
+  item "kubectl apply -f ${out}/secret.yaml"
+  item "kubectl apply -f ${SCRIPT_DIR}/csi/storageclass-rbd.yaml"
 }
 
 cmd_help() {
@@ -734,7 +808,7 @@ cmd_help() {
   ────────────────────────────────────────────────────────
   版本  CEPH_RELEASE=${CEPH_RELEASE}    池  ${RBD_POOL}
   配置  ${CEPH_NODES_FILE}
-  镜像  SKIP_MONITORING_STACK=${SKIP_MONITORING_STACK}
+  镜像  IMAGE_MIRROR=${IMAGE_MIRROR:-（官方 quay.io）}  SKIP_MONITORING_STACK=${SKIP_MONITORING_STACK}
 
   用法
     bash ${bin} --help              本帮助
@@ -774,6 +848,7 @@ cmd_help() {
     角色   bootstrap 只能一行；其余 node
     OSD    第 6 列必须是独立空盘（如 /dev/vdb），禁止系统盘
     监控   SKIP_MONITORING_STACK=1 可跳过 cephadm 自带 Prometheus
+    镜像   IMAGE_MIRROR=registry.../starbucket（容器）；CEPH_APT_MIRROR=https://.../debian-xxx（仅 apt）
 
   不要装在业务 K8s Master/Worker 上。三副本至少 3 台、每台一块 OSD。
 
@@ -797,7 +872,8 @@ usage_cmd() {
   用法  bash ${bin} images
         bash ${bin} images --help
   说明  第 1 个为 Ceph 主镜像（每台都要）；其余为监控栈（可 SKIP_MONITORING_STACK=1 跳过）
-  配置  CEPH_RELEASE=${CEPH_RELEASE}  CEPH_IMAGE=${CEPH_IMAGE:-（默认 quay.io/ceph/ceph）}
+  配置  CEPH_RELEASE=${CEPH_RELEASE}  IMAGE_MIRROR=${IMAGE_MIRROR:-（官方 quay.io）}
+        CEPH_IMAGE=${CEPH_IMAGE:-（由发行版 + IMAGE_MIRROR 推导）}
 
 EOF
       ;;
@@ -870,8 +946,9 @@ EOF
   作用  仅在 role=bootstrap 那台创建集群（MON/MGR/Dashboard）
   用法  sudo bash ${bin} bootstrap
         sudo bash ${bin} bootstrap --help
-  选项  conf：CLUSTER_NETWORK、CEPH_IMAGE、DASHBOARD_PASSWORD、SKIP_MONITORING_STACK
+  选项  conf：IMAGE_MIRROR、CEPH_IMAGE、CLUSTER_NETWORK、DASHBOARD_PASSWORD、SKIP_MONITORING_STACK
   说明  必须在 bootstrap 节点本机执行；已有 /etc/ceph/ceph.conf 且 ceph -s 可用则跳过
+        IMAGE_MIRROR 时 --image 与监控栈都会走该前缀；CEPH_APT_MIRROR 只影响 apt
   访问  https://<bootstrap-ip>:8443  用户 admin
 
 EOF

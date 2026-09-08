@@ -3,7 +3,7 @@
 与业务 Kubernetes **分开部署**：本目录装在 **至少 3 台专用存储机** 上，不占用 K8s Master/Worker。  
 业务集群只当客户端：装 Ceph CSI 后用 `StorageClass ceph-rbd` 动态开块设备（适合 Postgres 等）。
 
-Ubuntu 24 · `cephadm` · 默认发行版 **reef（18.2）** · 三副本 RBD 池 `kubernetes`
+Ubuntu 24 · `cephadm` · 默认发行版 **Tentacle（20.2）** · 三副本 RBD 池 `kubernetes`
 
 ---
 
@@ -51,7 +51,7 @@ ceph3 (MON / OSD)
 示例 `ceph-nodes.conf`（改成真实 IP / 密码 / 盘符）：
 
 ```text
-CEPH_RELEASE=reef
+CEPH_RELEASE=tentacle
 RBD_POOL=kubernetes
 
 172.16.10.131|ceph1|bootstrap|root|你的密码|/dev/sdb
@@ -61,11 +61,26 @@ RBD_POOL=kubernetes
 
 `bootstrap` 只能有一行，且 **bootstrap / add-hosts / osd / pool / export-rbd 都在这台执行**。
 
-国内拉包可在 conf 打开：
+国内拉 **apt 包**（cephadm）：
 
 ```text
-CEPH_APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/ceph/debian-reef
+CEPH_APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/ceph/debian-tentacle
 ```
+
+国内拉 **Docker 镜像**（与业务 K8s 一致，不要写进 CEPH_APT_MIRROR）：
+
+```text
+IMAGE_MIRROR=registry.cn-global.starbucket.com.cn/starbucket
+```
+
+`bash install-ceph.sh images` 会变成：
+
+```text
+registry.cn-global.starbucket.com.cn/starbucket/quay.io/ceph/ceph:v20
+...
+```
+
+`CEPH_APT_MIRROR` 只影响 `apt install cephadm`，**不会**改镜像列表。
 
 ---
 
@@ -84,7 +99,9 @@ CEPH_APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/ceph/debian-reef
 bash install-ceph.sh images
 ```
 
-默认（reef）包括 `quay.io/ceph/ceph:v18` 以及 cephadm 监控栈（Prometheus / Alertmanager / node-exporter / Grafana）。已有业务监控时在 conf 设 `SKIP_MONITORING_STACK=1`。
+默认（tentacle）包括 `quay.io/ceph/ceph:v20` 以及 cephadm 监控栈（Prometheus / Grafana 等）。已有业务监控时在 conf 设 `SKIP_MONITORING_STACK=1`。
+
+已用 Reef/Squid 装好的集群不能只改 conf，需按官方 `ceph orch upgrade` 升级或重装。
 
 ```bash
 chmod +x install-ceph.sh
