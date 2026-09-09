@@ -39,6 +39,7 @@ _CONF_CLUSTER_NETWORK=""
 _CONF_DASHBOARD_PASSWORD=""
 _CONF_OSD_ALLOW_ALL=""
 _CONF_SKIP_MONITORING_STACK=""
+_CONF_DEVICE_HEALTH_MONITORING=""
 
 is_conf_kv_line() {
   [[ "${1:-}" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]
@@ -71,6 +72,7 @@ load_conf_kv() {
       DASHBOARD_PASSWORD) _CONF_DASHBOARD_PASSWORD="${val}" ;;
       OSD_ALLOW_ALL) _CONF_OSD_ALLOW_ALL="${val}" ;;
       SKIP_MONITORING_STACK) _CONF_SKIP_MONITORING_STACK="${val}" ;;
+      DEVICE_HEALTH_MONITORING) _CONF_DEVICE_HEALTH_MONITORING="${val}" ;;
     esac
   done <"${f}"
 }
@@ -90,6 +92,8 @@ CLUSTER_NETWORK="${CLUSTER_NETWORK:-${_CONF_CLUSTER_NETWORK:-}}"
 DASHBOARD_PASSWORD="${DASHBOARD_PASSWORD:-${_CONF_DASHBOARD_PASSWORD:-}}"
 OSD_ALLOW_ALL="${OSD_ALLOW_ALL:-${_CONF_OSD_ALLOW_ALL:-0}}"
 SKIP_MONITORING_STACK="${SKIP_MONITORING_STACK:-${_CONF_SKIP_MONITORING_STACK:-0}}"
+# virtio / 云盘无 SMART：默认关；物理 SATA/NVMe 可设 1
+DEVICE_HEALTH_MONITORING="${DEVICE_HEALTH_MONITORING:-${_CONF_DEVICE_HEALTH_MONITORING:-0}}"
 
 if [[ -n "${CEPH_APT_MIRROR}" && "${CEPH_APT_MIRROR}" != http://* && "${CEPH_APT_MIRROR}" != https://* ]]; then
   if [[ -z "${IMAGE_MIRROR}" ]]; then
@@ -614,6 +618,109 @@ run_ceph() {
   fi
 }
 
+node_ip_by_name() {
+  local name="$1"
+  [[ -n "${name}" ]] || return 0
+  if [[ "${name}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    printf '%s\n' "${name}"
+    return 0
+  fi
+  list_node_lines | awk -F'|' -v h="${name}" '
+    { gsub(/[[:space:]]/, "", $1); gsub(/[[:space:]]/, "", $2) }
+    $2 == h { print $1; exit }
+  '
+}
+
+# orch 里某类守护进程所在主机 + 端口（json）；失败则空
+orch_daemon_host_port() {
+  local dtype="$1" dport="$2"
+  run_ceph orch ps --daemon-type "${dtype}" --format json 2>/dev/null | python3 -c '
+import json, sys
+want, dport = sys.argv[1], int(sys.argv[2])
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+items = data if isinstance(data, list) else []
+best = None
+for x in items:
+    if x.get("daemon_type") != want:
+        continue
+    best = x
+    st = str(x.get("status_desc") or x.get("status") or "").lower()
+    if st in ("running", "started", "1"):
+        break
+if not best:
+    sys.exit(0)
+host = best.get("hostname") or ""
+ports = best.get("ports") or []
+port = dport
+if isinstance(ports, list) and ports:
+    try:
+        port = int(ports[0])
+    except Exception:
+        port = dport
+print(f"{host} {port}")
+' "${dtype}" "${dport}" 2>/dev/null || true
+}
+
+# Dashboard「性能详细信息」按主机名反查会失败；Grafana/Prometheus 一律登记为 IP
+apply_dashboard_monitoring_ip() {
+  [[ "${SKIP_MONITORING_STACK}" == "1" ]] && return 0
+  [[ -f /etc/ceph/ceph.conf ]] || return 0
+  local gip gport pip pport aip aport host port line
+  gip="$(bootstrap_ip)"
+  gport=3000
+  pip="$(bootstrap_ip)"
+  pport=9095
+  aip="$(bootstrap_ip)"
+  aport=9093
+
+  line="$(orch_daemon_host_port grafana 3000 || true)"
+  host="$(awk '{print $1}' <<<"${line}")"
+  port="$(awk '{print $2}' <<<"${line}")"
+  if [[ -n "${host}" ]]; then
+    gip="$(node_ip_by_name "${host}")"
+    [[ -n "${gip}" ]] || gip="$(bootstrap_ip)"
+    [[ -n "${port}" ]] && gport="${port}"
+  fi
+  line="$(orch_daemon_host_port prometheus 9095 || true)"
+  host="$(awk '{print $1}' <<<"${line}")"
+  port="$(awk '{print $2}' <<<"${line}")"
+  if [[ -n "${host}" ]]; then
+    pip="$(node_ip_by_name "${host}")"
+    [[ -n "${pip}" ]] || pip="$(bootstrap_ip)"
+    [[ -n "${port}" ]] && pport="${port}"
+  fi
+  line="$(orch_daemon_host_port alertmanager 9093 || true)"
+  host="$(awk '{print $1}' <<<"${line}")"
+  port="$(awk '{print $2}' <<<"${line}")"
+  if [[ -n "${host}" ]]; then
+    aip="$(node_ip_by_name "${host}")"
+    [[ -n "${aip}" ]] || aip="$(bootstrap_ip)"
+    [[ -n "${port}" ]] && aport="${port}"
+  fi
+
+  item "监控入口改用 IP（Grafana ${gip}:${gport}）"
+  local i okg=0
+  for i in 1 2 3 4 5 6 7 8; do
+    if run_ceph dashboard set-grafana-api-url "https://${gip}:${gport}" >/dev/null 2>&1 \
+      && run_ceph dashboard set-grafana-frontend-api-url "https://${gip}:${gport}" >/dev/null 2>&1; then
+      okg=1
+      break
+    fi
+    sleep 5
+  done
+  if [[ "${okg}" == "1" ]]; then
+    run_ceph dashboard set-grafana-api-ssl-verify false >/dev/null 2>&1 || true
+    run_ceph dashboard set-prometheus-api-host "http://${pip}:${pport}" >/dev/null 2>&1 || true
+    run_ceph dashboard set-alertmanager-api-host "http://${aip}:${aport}" >/dev/null 2>&1 || true
+    ok "Grafana  https://${gip}:${gport}  Prometheus  http://${pip}:${pport}"
+  else
+    warn "Dashboard 监控 URL 未写上（Grafana 可能还在拉起，稍后重跑 bootstrap 或 add-hosts）"
+  fi
+}
+
 cmd_bootstrap() {
   need_root bootstrap
   local bip bhost
@@ -627,6 +734,7 @@ cmd_bootstrap() {
 
   if [[ -f /etc/ceph/ceph.conf ]] && run_ceph -s >/dev/null 2>&1; then
     ok "集群已存在，跳过"
+    apply_dashboard_monitoring_ip
     run_ceph -s
     return 0
   fi
@@ -635,7 +743,8 @@ cmd_bootstrap() {
 
   local ceph_img cfg_tmp=""
   ceph_img="$(default_ceph_image)"
-  local args=(bootstrap --mon-ip "${bip}" --ssh-user root --allow-fqdn-hostname --image "${ceph_img}")
+  # --image 是 cephadm 全局参数，必须写在子命令 bootstrap 之前
+  local args=(--image "${ceph_img}" --docker bootstrap --mon-ip "${bip}" --ssh-user root --allow-fqdn-hostname)
   [[ -n "${CLUSTER_NETWORK}" ]] && args+=(--cluster-network "${CLUSTER_NETWORK}")
   if [[ -n "${DASHBOARD_PASSWORD}" ]]; then
     args+=(--initial-dashboard-password "${DASHBOARD_PASSWORD}" --dashboard-password-noupdate)
@@ -655,7 +764,7 @@ cmd_bootstrap() {
     args+=(--config "${cfg_tmp}")
   fi
 
-  item "cephadm bootstrap  --image ${ceph_img}"
+  item "cephadm --image ${ceph_img} bootstrap"
   if cephadm "${args[@]}"; then
     :
   else
@@ -670,13 +779,39 @@ cmd_bootstrap() {
   ok "集群已创建"
   ok "Dashboard  https://${bip}:8443  admin"
   item "密码见 bootstrap 输出，或: ceph dashboard ac-user-show admin"
+  apply_dashboard_monitoring_ip
   run_ceph -s || true
+}
+
+push_cephadm_ssh_key() {
+  local pubf="/etc/ceph/ceph.pub"
+  [[ -f "${pubf}" ]] || err "缺少 ${pubf}，请先 bootstrap"
+  ensure_sshpass
+  item "把 cephadm 公钥写入各节点 authorized_keys"
+  local ip host role user pass
+  while IFS='|' read -r ip host role user pass disks; do
+    [[ -n "${ip}" ]] || continue
+    [[ "$(echo "${role}" | tr 'A-Z' 'a-z')" == "bootstrap" ]] && continue
+    is_local_ip "${ip}" && continue
+    pass="$(printf '%s' "${pass:-}" | sed 's/\r$//;s/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if ! remote_scp "${user}" "${ip}" "${pass}" "${pubf}" "/tmp/ceph.pub"; then
+      fail "${host}  无法上传 ceph.pub（先 ssh-keys 或把 conf 密码改成真实值）"
+      continue
+    fi
+    if remote_ssh "${user}" "${ip}" "${pass}" \
+      'mkdir -p /root/.ssh; chmod 700 /root/.ssh; touch /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys; grep -qxF "$(cat /tmp/ceph.pub)" /root/.ssh/authorized_keys || cat /tmp/ceph.pub >> /root/.ssh/authorized_keys; rm -f /tmp/ceph.pub'; then
+      ok "cephadm 密钥  ${host}"
+    else
+      fail "${host}  写入 authorized_keys 失败"
+    fi
+  done < <(list_ssh_nodes)
 }
 
 cmd_add_hosts() {
   need_root add-hosts
   [[ -f /etc/ceph/ceph.conf ]] || err "请先在 bootstrap 节点执行 bootstrap"
   step "add-hosts"
+  push_cephadm_ssh_key
   local ip host role user pass disks
   while IFS='|' read -r ip host role user pass disks; do
     [[ -n "${ip}" ]] || continue
@@ -687,10 +822,11 @@ cmd_add_hosts() {
     if run_ceph orch host add "${host}" "${ip}"; then
       ok "${host}  ${ip}"
     else
-      warn "${host}  加入失败（可能已在集群中）"
+      fail "${host}  SSH 失败或已在集群中"
     fi
   done < <(list_ssh_nodes)
   run_ceph orch host ls
+  apply_dashboard_monitoring_ip
   sync_csi_example_from_conf
 }
 
@@ -706,39 +842,102 @@ cmd_osd() {
     esac
   done
 
+  item "当前设备清单"
+  run_ceph orch device ls || true
+
   if [[ "${use_all}" == "1" ]]; then
     [[ "${OSD_ALLOW_ALL}" == "1" ]] || err "须在 conf 设 OSD_ALLOW_ALL=1，且盘上无数据"
     warn "将清空所有空闲块设备做 OSD"
     run_ceph orch apply osd --all-available-devices
-    run_ceph osd tree
-    return 0
+  else
+    local ip host role user pass disks d
+    while IFS='|' read -r ip host role user pass disks; do
+      [[ -n "${ip}" ]] || continue
+      disks="$(printf '%s' "${disks:-}" | sed 's/\r$//;s/^[[:space:]]*//;s/[[:space:]]*$//')"
+      [[ -n "${disks}" ]] || { skip "${host}  未配 OSD 盘"; continue; }
+      IFS=',' read -ra _devs <<<"${disks}"
+      for d in "${_devs[@]}"; do
+        d="$(printf '%s' "${d}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        [[ -n "${d}" ]] || continue
+        item "准备 ${host}:${d}"
+        # 残留签名会导致 add 成功但 OSD 起不来；先 zap（会清空该盘）
+        run_ceph orch device zap "${host}" "${d}" --force 2>/dev/null \
+          && ok "已 zap ${host}:${d}" \
+          || item "zap 跳过/无需（继续 add）"
+        if run_ceph orch daemon add osd "${host}:${d}"; then
+          item "已下发 add osd ${host}:${d}"
+        else
+          fail "${host}:${d}  add 失败"
+        fi
+      done
+    done < <(list_ssh_nodes)
   fi
 
-  local ip host role user pass disks d
-  while IFS='|' read -r ip host role user pass disks; do
-    [[ -n "${ip}" ]] || continue
-    disks="$(printf '%s' "${disks:-}" | sed 's/\r$//;s/^[[:space:]]*//;s/[[:space:]]*$//')"
-    [[ -n "${disks}" ]] || { skip "${host}  未配 OSD 盘"; continue; }
-    IFS=',' read -ra _devs <<<"${disks}"
-    for d in "${_devs[@]}"; do
-      d="$(printf '%s' "${d}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-      [[ -n "${d}" ]] || continue
-      if run_ceph orch daemon add osd "${host}:${d}"; then
-        ok "${host}:${d}"
-      else
-        fail "${host}:${d}  盘占用或路径不对"
-      fi
-    done
-  done < <(list_ssh_nodes)
-  sleep 3
+  item "等待 OSD 起来（最长 180s）"
+  local i n=0
+  for i in $(seq 1 36); do
+    n="$(run_ceph osd ls 2>/dev/null | grep -c . || true)"
+    if [[ "${n}" -ge 1 ]]; then
+      ok "已有 ${n} 个 OSD"
+      break
+    fi
+    sleep 5
+  done
+  run_ceph orch ps --daemon-type osd || true
   run_ceph osd tree || true
   run_ceph -s || true
+  n="$(run_ceph osd ls 2>/dev/null | grep -c . || true)"
+  if [[ "${n}" -lt 1 ]]; then
+    fail "仍无 OSD。请执行: ceph orch device ls ; ceph logs ; 并确认 vdb 未挂载"
+    item "手动: ceph orch device zap ceph1 /dev/vdb --force"
+    item "然后: ceph orch daemon add osd ceph1:/dev/vdb"
+    return 1
+  fi
+  if [[ "${DEVICE_HEALTH_MONITORING}" != "1" ]]; then
+    apply_device_health_monitoring 0
+  fi
+  ok "osd 完成（${n} 个）"
+}
+
+wait_pool_ready() {
+  local pool="$1" timeout_s="${2:-180}" elapsed=0
+  item "等待集群可写（最长 ${timeout_s}s）"
+  while (( elapsed < timeout_s )); do
+    local st
+    st="$(run_ceph -s 2>/dev/null || true)"
+    if echo "${st}" | grep -q 'HEALTH_OK'; then
+      ok "HEALTH_OK（约 ${elapsed}s）"
+      return 0
+    fi
+    # WARN 但无 OSD down / 无 creating 也可继续
+    if echo "${st}" | grep -q 'HEALTH_WARN' \
+      && ! echo "${st}" | grep -Eq 'osd.*(down|out)|PG.*creat|noout|nobackfill'; then
+      if ! echo "${st}" | grep -qi 'creating'; then
+        ok "集群可写 WARN（约 ${elapsed}s）"
+        return 0
+      fi
+    fi
+    sleep 5
+    elapsed=$((elapsed + 5))
+    if (( elapsed % 30 == 0 )); then
+      item "仍等待… ${elapsed}s"
+      echo "${st}" | head -n 15
+    fi
+  done
+  warn "等待超时，继续 rbd pool init（失败时看 ceph -s）"
+  return 1
 }
 
 cmd_pool() {
   need_root pool
   [[ -f /etc/ceph/ceph.conf ]] || err "请先 bootstrap"
   step "pool  ${RBD_POOL}"
+
+  item "检查 OSD / 集群状态"
+  if ! run_ceph osd tree 2>/dev/null | grep -q 'osd\.[0-9].*up'; then
+    err "没有 up 的 OSD，请先 sudo bash install-ceph.sh osd 且 ceph -s 正常"
+  fi
+
   if run_ceph osd pool ls | grep -qx "${RBD_POOL}"; then
     skip "池已存在"
   else
@@ -749,15 +948,30 @@ cmd_pool() {
     run_ceph osd pool set "${RBD_POOL}" min_size 2 || true
     ok "池 ${RBD_POOL}"
   fi
-  if command -v rbd >/dev/null 2>&1; then
-    rbd pool init "${RBD_POOL}" || true
+
+  wait_pool_ready "${RBD_POOL}" 300 || true
+
+  item "rbd pool init ${RBD_POOL}"
+  if command -v timeout >/dev/null 2>&1; then
+    if command -v rbd >/dev/null 2>&1; then
+      timeout 120 rbd pool init "${RBD_POOL}" && ok "rbd pool init" \
+        || warn "rbd pool init 超时/失败（可稍后手动: rbd pool init ${RBD_POOL}）"
+    else
+      timeout 180 cephadm shell -- rbd pool init "${RBD_POOL}" && ok "rbd pool init" \
+        || warn "rbd pool init 超时/失败"
+    fi
   else
-    cephadm shell -- rbd pool init "${RBD_POOL}" || true
+    if command -v rbd >/dev/null 2>&1; then
+      rbd pool init "${RBD_POOL}" && ok "rbd pool init" || warn "rbd pool init 失败"
+    else
+      cephadm shell -- rbd pool init "${RBD_POOL}" && ok "rbd pool init" || warn "rbd pool init 失败"
+    fi
   fi
+
+  item "配置 client.kubernetes"
   if run_ceph auth get client.kubernetes >/dev/null 2>&1; then
     skip "client.kubernetes 已存在"
   else
-    item "创建 client.kubernetes"
     run_ceph auth get-or-create client.kubernetes \
       mon "profile rbd" \
       osd "profile rbd pool=${RBD_POOL}" \
@@ -765,6 +979,40 @@ cmd_pool() {
     ok "client.kubernetes"
   fi
   sync_csi_example_from_conf
+  ok "pool 完成"
+}
+
+# virtio 无 SMART；开设备健康只会 Dashboard 报 smartctl -22
+apply_device_health_monitoring() {
+  local on="${1:-${DEVICE_HEALTH_MONITORING}}"
+  if [[ "${on}" == "1" || "${on}" == "on" || "${on}" == "enable" ]]; then
+    item "开启磁盘 SMART 监控（仅物理盘有效）"
+    run_ceph device monitoring on || true
+    run_ceph config set mgr mgr/devicehealth/enable_monitoring true || true
+    run_ceph config set mgr mgr/devicehealth/scrape_frequency 86400 || true
+    ok "device health = on"
+  else
+    item "关闭磁盘 SMART 监控（virtio/云盘无 SMART，避免 Dashboard 报错）"
+    run_ceph device monitoring off || true
+    run_ceph config set mgr mgr/devicehealth/enable_monitoring false || true
+    ok "device health = off"
+  fi
+}
+
+cmd_device_health() {
+  need_root device-health
+  [[ -f /etc/ceph/ceph.conf ]] || err "请先 bootstrap"
+  local mode="${1:-off}"
+  step "device-health  ${mode}"
+  case "${mode}" in
+    off|0|disable|false) apply_device_health_monitoring 0 ;;
+    on|1|enable|true)    apply_device_health_monitoring 1 ;;
+    status)
+      run_ceph device monitoring status 2>/dev/null || run_ceph config get mgr mgr/devicehealth/enable_monitoring || true
+      run_ceph device ls || true
+      ;;
+    *) err "用法: $0 device-health off|on|status" ;;
+  esac
 }
 
 cmd_status() {
@@ -797,6 +1045,188 @@ cmd_export_rbd() {
   ok "${out}/secret.yaml  （含密钥，勿提交 git）"
   item "kubectl apply -f ${out}/secret.yaml"
   item "kubectl apply -f ${SCRIPT_DIR}/csi/storageclass-rbd.yaml"
+}
+
+# 停占用、拆 Ceph LVM、wipe 签名，让 /dev/vdb 重新变成空盘
+wipe_osd_device() {
+  local d="$1" vg mapper
+  [[ -n "${d}" && -b "${d}" ]] || return 0
+  case "${d}" in
+    /dev/vda|/dev/vda[0-9]*|/dev/sda|/dev/sda[0-9]*|/dev/nvme0n1|/dev/nvme0n1p*)
+      warn "跳过疑似系统盘 ${d}"
+      return 0
+      ;;
+  esac
+  item "初始化数据盘 ${d}"
+  umount "${d}" 2>/dev/null || true
+  umount "${d}"p* 2>/dev/null || true
+  umount "${d}"[0-9]* 2>/dev/null || true
+
+  if command -v docker >/dev/null 2>&1; then
+    docker ps -aq --filter name=osd | xargs -r docker rm -f 2>/dev/null || true
+    docker ps -aq --filter name=ceph- | xargs -r docker rm -f 2>/dev/null || true
+  fi
+
+  while read -r vg; do
+    vg="$(echo "${vg}" | tr -d ' ')"
+    [[ -n "${vg}" && "${vg}" != "VG" ]] || continue
+    item "拆除 VG ${vg}"
+    vgchange -an "${vg}" 2>/dev/null || true
+    lvremove -fy "${vg}" 2>/dev/null || true
+    vgremove -fy "${vg}" 2>/dev/null || true
+  done < <(pvs --noheadings -o vg_name "${d}" 2>/dev/null || true)
+
+  # lsblk 上仍挂着的 mapper
+  while read -r mapper; do
+    [[ -n "${mapper}" ]] || continue
+    dmsetup remove -f "${mapper}" 2>/dev/null || true
+    dmsetup remove -f "/dev/mapper/${mapper}" 2>/dev/null || true
+  done < <(lsblk -ln -o NAME,TYPE "${d}" 2>/dev/null | awk '$2=="lvm"{print $1}')
+
+  pvremove -ff -y "${d}" 2>/dev/null || true
+  wipefs -af "${d}" 2>/dev/null || wipefs -a "${d}" 2>/dev/null || true
+  sgdisk --zap-all "${d}" 2>/dev/null || true
+  dd if=/dev/zero of="${d}" bs=1M count=32 conv=fsync status=none 2>/dev/null || true
+  partprobe "${d}" 2>/dev/null || true
+  command -v udevadm >/dev/null && udevadm settle 2>/dev/null || true
+  sleep 1
+  if lsblk -ln -o NAME,TYPE "${d}" 2>/dev/null | grep -qw lvm; then
+    fail "${d} 仍有 LVM，请手工 vgremove 后再装"
+    lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT "${d}" || true
+    return 1
+  fi
+  ok "${d} 已清空（无 LVM / 无挂载）"
+  lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT "${d}" || true
+}
+
+local_osd_disks_from_conf() {
+  local a ip host role user pass disks
+  while IFS='|' read -r ip host role user pass disks; do
+    [[ -n "${ip}" ]] || continue
+    if is_local_ip "${ip}" || [[ "$(hostname -s 2>/dev/null)" == "${host}" ]] || [[ "$(hostname)" == "${host}" ]]; then
+      printf '%s' "${disks:-}" | sed 's/\r$//;s/^[[:space:]]*//;s/[[:space:]]*$//'
+      echo
+    fi
+  done < <(list_node_lines)
+}
+
+# 本机彻底卸 Ceph（rm-cluster + 默认清空 OSD 数据盘）
+destroy_local() {
+  local wipe_osd="${1:-1}"
+  local fsid="" d disks disk
+  if [[ -f /etc/ceph/ceph.conf ]]; then
+    fsid="$(awk -F' *= *' '/^[[:space:]]*fsid[[:space:]]*=/{print $2; exit}' /etc/ceph/ceph.conf | tr -d '[:space:]')"
+  fi
+  if [[ -z "${fsid}" ]] && command -v cephadm >/dev/null 2>&1; then
+    fsid="$(cephadm ls 2>/dev/null | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d[0]["fsid"] if d else "")' 2>/dev/null || true)"
+  fi
+
+  if command -v docker >/dev/null 2>&1; then
+    item "停止本机 Ceph / OSD 容器"
+    docker ps -aq --filter name=osd | xargs -r docker rm -f 2>/dev/null || true
+    docker ps -aq --filter name=ceph- | xargs -r docker rm -f 2>/dev/null || true
+  fi
+  systemctl stop 'ceph-*.service' 'ceph-*.target' 2>/dev/null || true
+
+  if [[ "${wipe_osd}" == "1" ]]; then
+    disks="$(local_osd_disks_from_conf | head -n 1 | tr ',' ' ')"
+    if [[ -z "${disks// }" ]]; then
+      warn "conf 未匹配到本机 OSD 盘，尝试拆除所有 ceph-* VG"
+      while read -r vg; do
+        vg="$(echo "${vg}" | tr -d ' ')"
+        [[ "${vg}" == ceph-* ]] || continue
+        vgchange -an "${vg}" 2>/dev/null || true
+        lvremove -fy "${vg}" 2>/dev/null || true
+        vgremove -fy "${vg}" 2>/dev/null || true
+      done < <(vgs --noheadings -o vg_name 2>/dev/null || true)
+    else
+      for d in ${disks}; do
+        wipe_osd_device "${d}"
+      done
+    fi
+  fi
+
+  if [[ -n "${fsid}" ]] && command -v cephadm >/dev/null 2>&1; then
+    item "cephadm rm-cluster  fsid=${fsid}"
+    cephadm rm-cluster --fsid "${fsid}" --force || warn "rm-cluster 失败，继续清残留"
+  else
+    warn "未找到 fsid，只清本机残留目录"
+  fi
+  rm -rf /etc/ceph /var/lib/ceph /var/log/ceph /var/run/ceph \
+    /root/.ceph 2>/dev/null || true
+  rm -f /etc/systemd/system/ceph*.service /etc/systemd/system/ceph*.target 2>/dev/null || true
+  systemctl daemon-reload 2>/dev/null || true
+
+  if [[ "${wipe_osd}" == "1" ]]; then
+    disks="$(local_osd_disks_from_conf | head -n 1 | tr ',' ' ')"
+    for d in ${disks}; do
+      wipe_osd_device "${d}"
+    done
+  fi
+  ok "本机 Ceph 已清理  $(hostname)"
+}
+
+cmd_destroy() {
+  need_root destroy
+  local all=0 wipe=1 yes=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all) all=1; shift ;;
+      --keep-disks) wipe=0; shift ;;
+      --yes|-y) yes=1; shift ;;
+      *) err "用法: $0 destroy [--all] [--keep-disks] [--yes]" ;;
+    esac
+  done
+  step "destroy"
+  if [[ "${yes}" != "1" ]]; then
+    warn "将删除 Ceph 集群数据；OSD 盘会被 wipe（除非 --keep-disks）"
+    warn "5 秒后继续… Ctrl+C 取消"
+    sleep 5
+  fi
+  if [[ "${all}" == "1" ]]; then
+    ensure_sshpass
+    item "在 conf 全部节点执行清理"
+    local ip host role user pass disks
+    while IFS='|' read -r ip host role user pass disks; do
+      [[ -n "${ip}" ]] || continue
+      pass="$(printf '%s' "${pass:-}" | sed 's/\r$//;s/^[[:space:]]*//;s/[[:space:]]*$//')"
+      item "${host}  ${ip}"
+      if is_local_ip "${ip}"; then
+        destroy_local "${wipe}"
+        continue
+      fi
+      sync_install_to_node "${user}" "${ip}" "${pass}" || {
+        fail "${host}  同步脚本失败"
+        continue
+      }
+      local remote_flags=(--yes)
+      [[ "${wipe}" == "1" ]] || remote_flags+=(--keep-disks)
+      if remote_ssh "${user}" "${ip}" "${pass}" \
+        "cd ${REMOTE_DIR} && bash install-ceph.sh destroy-local ${remote_flags[*]}"; then
+        ok "${host}"
+      else
+        fail "${host}  清理失败"
+      fi
+    done < <(list_ssh_nodes)
+  else
+    destroy_local "${wipe}"
+  fi
+  sum "destroy 结束；重装前确认 hostname 已是 ceph1/2/3（勿再叫 k8s-n1）"
+}
+
+cmd_destroy_local() {
+  need_root destroy-local
+  local wipe=1 yes=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --keep-disks) wipe=0; shift ;;
+      --yes|-y) yes=1; shift ;;
+      *) err "用法: $0 destroy-local [--keep-disks] [--yes]" ;;
+    esac
+  done
+  [[ "${yes}" == "1" ]] || { warn "5 秒后清理本机…"; sleep 5; }
+  step "destroy-local  $(hostname)"
+  destroy_local "${wipe}"
 }
 
 cmd_help() {
@@ -838,6 +1268,9 @@ cmd_help() {
       osd            按节点表第 6 列磁盘创建 OSD
       pool           创建 RBD 池与 client.kubernetes
       status         ceph -s / host / osd tree
+      device-health  磁盘 SMART：off（virtio 默认）| on（物理盘）| status
+      destroy         卸载集群；--all 清全部节点（拆 LVM + wipe OSD 盘，加 --yes）
+      destroy-local   只清本机（同样初始化数据盘）
 
     CSI（业务 K8s）
       csi-example    按 conf 刷新 csi/secret.yaml.example 的 monitors
@@ -949,6 +1382,7 @@ EOF
   选项  conf：IMAGE_MIRROR、CEPH_IMAGE、CLUSTER_NETWORK、DASHBOARD_PASSWORD、SKIP_MONITORING_STACK
   说明  必须在 bootstrap 节点本机执行；已有 /etc/ceph/ceph.conf 且 ceph -s 可用则跳过
         IMAGE_MIRROR 时 --image 与监控栈都会走该前缀；CEPH_APT_MIRROR 只影响 apt
+        已有集群再跑一次会补写 Grafana/Prometheus 为 IP（性能详情不再解析主机名）
   访问  https://<bootstrap-ip>:8443  用户 admin
 
 EOF
@@ -1003,6 +1437,34 @@ EOF
   用法  bash ${bin} status
         bash ${bin} status --help
   说明  无 /etc/ceph/ceph.conf 时只打印节点表
+
+EOF
+      ;;
+    device-health)
+      cat <<EOF
+
+  命令  device-health
+  ────────────────────────────────
+  作用  开关 Ceph 磁盘 SMART（devicehealth）。virtio/云盘无 SMART，开着会 Dashboard 报 smartctl -22
+  用法  sudo bash ${bin} device-health off
+        sudo bash ${bin} device-health on
+        sudo bash ${bin} device-health status
+  配置  DEVICE_HEALTH_MONITORING=0（默认关）| 1（物理 SATA/NVMe 可开）
+  说明  osd 完成后若为 0 会自动关闭；升级物理盘后再 on
+
+EOF
+      ;;
+    destroy|destroy-local)
+      cat <<EOF
+
+  命令  destroy / destroy-local
+  ────────────────────────────────
+  作用  卸载 Ceph：停容器、cephadm rm-cluster、拆除 ceph-* LVM，再 wipe conf 里的 OSD 盘
+  用法  sudo bash ${bin} destroy --all --yes
+        sudo bash ${bin} destroy --all --yes --keep-disks
+        sudo bash ${bin} destroy-local --yes
+  注意  重装前每台 hostname 必须是 ceph1/2/3；不要 --keep-disks，否则 /dev/vdb 残留会 Device busy
+        保留数据盘内容才用 --keep-disks
 
 EOF
       ;;
@@ -1070,6 +1532,9 @@ main() {
     osd)            cmd_osd "$@" ;;
     pool)           cmd_pool "$@" ;;
     status)         cmd_status "$@" ;;
+    device-health)  cmd_device_health "$@" ;;
+    destroy)        cmd_destroy "$@" ;;
+    destroy-local)  cmd_destroy_local "$@" ;;
     export-rbd)     cmd_export_rbd "$@" ;;
     csi-example)    cmd_csi_example "$@" ;;
     *) err "未知命令: ${cmd}（bash $0 --help  或  bash $0 help <命令>）" ;;

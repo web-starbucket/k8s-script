@@ -123,7 +123,7 @@ sudo bash install-ceph.sh status
 
 `HEALTH_OK`、3 个 OSD `up`、池 `kubernetes` 存在即完成。
 
-Dashboard：`https://<ceph1>:8443` ，用户 `admin`。密码见 bootstrap 输出，或：
+Dashboard：`https://<bootstrap 节点 IP>:8443`（例如 `https://172.16.10.133:8443`），用户 `admin`。Grafana/Prometheus 由脚本写成 IP，不依赖主机名解析。密码见 bootstrap 输出，或：
 
 ```bash
 ceph dashboard ac-user-show admin
@@ -292,11 +292,39 @@ ceph auth get client.kubernetes
 `bash install-ceph.sh --help`  
 `bash install-ceph.sh help osd`（任意命令：`help <命令>` 或 `<命令> --help`）
 
----
+虚拟机 virtio 盘没有 SMART。Dashboard「设备健康 / smartctl -22」时在 ceph1 执行：
 
-### 9. 和业务集群的关系
+```bash
+sudo bash install-ceph.sh device-health off
+```
 
-| 集群 | 机器 | 装什么 |
-|------|------|--------|
-| 本目录 Ceph | ceph1/2/3 | MON / MGR / OSD |
-| `install-k8s` | m1/m2/m3 + worker | 只装 CSI 客户端，**不跑 OSD** |
+conf 默认 `DEVICE_HEALTH_MONITORING=0`；物理 SATA/NVMe 再改为 `1` 并 `device-health on`。
+
+### 卸载并重装
+
+**先改主机名**（三台都不要再叫 `k8s-n1`，否则 Grafana 仍会找旧名）：
+
+```bash
+# 在 133/134/135 上分别：
+hostnamectl set-hostname ceph1   # / ceph2 / ceph3
+```
+
+在 ceph1（把最新 `install-ceph.sh` 拷到 `/opt/install-ceph/`）：
+
+```bash
+# 卸三台：停 OSD 容器、拆 ceph LVM、wipe /dev/vdb（否则重装会 Device busy）
+sudo bash install-ceph.sh destroy --all --yes
+# 每台确认数据盘已空：lsblk /dev/vdb  不应再有 LVM / ceph_bluestore
+
+# 确认主机名与 hosts
+hostname   # ceph1
+sudo bash install-ceph.sh ssh-keys
+sudo bash install-ceph.sh prepare-all
+sudo bash install-ceph.sh hosts-all
+sudo bash install-ceph.sh bootstrap
+# 推送 /etc/ceph/ceph.pub 到 134/135 后：
+sudo bash install-ceph.sh add-hosts
+sudo bash install-ceph.sh osd
+sudo bash install-ceph.sh pool
+sudo bash install-ceph.sh device-health off
+```
