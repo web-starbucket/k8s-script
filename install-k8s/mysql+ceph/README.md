@@ -28,12 +28,61 @@ kubectl get cm mysql-topology -o jsonpath='{.data.primary-pod}{"\n"}'
 kubectl get ep mysql
 ```
 
+# 查看当前主库实列
+```
+SELECT @@hostname, @@read_only, @@super_read_only;
+```
+
 `mysql-0` 被 STS 拉起后会成为从库，**不会**再切回 `mysql-0`。要手工切回：`bash promote-replica.sh mysql-0`
 
 三副本时把 STS `replicas: 3`，挂掉当前主会升其它存活节点。
 
-### 3. 注意
+
+
+### 3. 在线修改数据库账号密码
+```
+kubectl exec "$PRI" -c mysql -- mysql --protocol=SOCKET -uroot -p"$OLD" -e "
+  ALTER USER 'root'@'localhost' IDENTIFIED BY 'remo@**123';
+  ALTER USER 'root'@'%' IDENTIFIED BY 'remo@**123';
+  ALTER USER 'root'@'127.0.0.1' IDENTIFIED BY 'remo@**123';
+  ALTER USER 'repl'@'%' IDENTIFIED BY 'remo@**123';
+  FLUSH PRIVILEGES;"
+
+
+# 更新实际的从库
+kubectl exec mysql-0 -c mysql -- mysql --protocol=SOCKET -uroot -p'remo@**123' -e "
+  STOP REPLICA;
+  CHANGE REPLICATION SOURCE TO SOURCE_PASSWORD='remo@**123';
+  START REPLICA;"
+
+kubectl patch secret mysql-auth --type merge -p '{"stringData":{
+  "root-password":"remo@**123",
+  "replication-password":"remo@**123"
+}}'
+
+
+kubectl rollout restart deploy/mysql-controller
+kubectl rollout restart sts/mysql
+kubectl logs -f deploy/mysql-controller
+```
+
+### 4. 删除残留从库pvc
+查看使用
+```
+kubectl get pvc | grep mysql
+kubectl get pod -l app=mysql -o wide
+kubectl get sts mysql -o jsonpath='{.spec.replicas}{"\n"}'
+```
+
+删除未使用
+```
+kubectl delete pvc data-mysql-2 data-mysql-3
+```
+
+### 5. 注意
 
 - 从库也需开 `log-bin` + `log_replica_updates`（`mysql.yaml` 已配），否则升主后再挂回从库易缺事务。
 - 复制报 1236（binlog 已 purge）时，用 `rebuild-replica.sh` 按当前主 dump 重建从库。
 - 密码在 Secret `mysql-auth`，部署前改掉。
+
+
