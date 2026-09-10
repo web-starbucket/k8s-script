@@ -1,22 +1,12 @@
 ## MySQL：StatefulSet + Ceph RBD + 故障转移 + TCPRoute
 
-- **一个** `StatefulSet/mysql`，`replicas: 2`（可改成 3 → `mysql-0/1/2`）
-- **一 Pod 一盘**（`ceph-rbd`）
-- ConfigMap `mysql-topology`：`primary-pod` 记录当前主（首次默认 `mysql-0`）
-- 客户端只连 **Service `mysql`**（`mysql.role=primary`）← TCPRoute
-- **`mysql-failover`**：
-  1. 当前主挂掉 ≥1s → 自动升其它存活节点
-  2. **不回切**：谁升主就一直当主；旧主恢复后改成从库并复制到新主
 
 ### 1. 部署
 
 ```bash
-cd /opt/k8s-script/install-k8s/mysql-ceph-rbd
 kubectl apply -f mysql.yaml
-kubectl apply -f failover.yaml
-kubectl apply -f tcproute-mysql.yaml
-kubectl rollout restart deploy/mysql-failover
-kubectl logs -f deploy/mysql-failover
+kubectl apply -f mysql-controller.yaml
+kubectl logs -f deploy/mysql-controller
 ```
 
 状态行仅在变化时打印，例如：
@@ -28,7 +18,7 @@ kubectl logs -f deploy/mysql-failover
 ### 2. 测故障转移
 
 ```bash
-kubectl logs -f deploy/mysql-failover
+kubectl logs -f deploy/mysql-controller
 
 # 宕掉当前主（例如 mysql-0）
 kubectl delete pod mysql-0 --grace-period=0 --force

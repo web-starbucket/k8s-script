@@ -1,17 +1,14 @@
-# 故障转移：谁是主就一直当主，旧主恢复后只做从库，不自动回切
-# 当前主挂掉 ≥ FAIL_AFTER → 升其它存活节点
-# Service/mysql / TCPRoute 始终跟随 mysql.role=primary
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: mysql-failover
+  name: mysql-controller
   namespace: default
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: mysql-failover
+  name: mysql-controller
   namespace: default
 rules:
   - apiGroups: [""]
@@ -21,21 +18,21 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: mysql-failover
+  name: mysql-controller
   namespace: default
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: mysql-failover
+  name: mysql-controller
 subjects:
   - kind: ServiceAccount
-    name: mysql-failover
+    name: mysql-controller
     namespace: default
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: mysql-failover
+  name: mysql-controller
   namespace: default
 data:
   run.sh: |
@@ -68,7 +65,7 @@ data:
     fi
     if [[ -z "${PW}" || -z "${REPL_PW}" ]]; then
       log "ERROR 缺少 root/replication 密码。Secret mysql-auth 需要 key: root-password + replication-password"
-      log "修复: kubectl apply -f mysql.yaml && kubectl apply -f failover.yaml && kubectl rollout restart deploy/mysql-failover"
+      log "修复: kubectl apply -f mysql.yaml && kubectl apply -f controller.yaml && kubectl rollout restart deploy/mysql-controller"
       kubectl -n "${NS}" get secret mysql-auth -o jsonpath='{.data}' 2>/dev/null; echo
       sleep 30
       exit 1
@@ -357,19 +354,19 @@ data:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mysql-failover
+  name: mysql-controller
   namespace: default
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: mysql-failover
+      app: mysql-controller
   template:
     metadata:
       labels:
-        app: mysql-failover
+        app: mysql-controller
     spec:
-      serviceAccountName: mysql-failover
+      serviceAccountName: mysql-controller
       containers:
         - name: controller
           image: registry.cn-global.starbucket.com.cn/starbucket/docker.io/alpine/k8s:1.33.1
@@ -403,5 +400,5 @@ spec:
       volumes:
         - name: scripts
           configMap:
-            name: mysql-failover
+            name: mysql-controller
             defaultMode: 0755
