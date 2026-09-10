@@ -1,0 +1,28 @@
+# MySQL TCP 入口：Gateway/eg listener mysql:3306 → Service/mysql（仅 mysql.role=primary）
+#
+# 1) 补 listener（若已有 name=mysql 会报 already exists，可忽略）
+#    kubectl patch gateway eg -n default --type=json \
+#      --patch-file gateway-mysql-listener-patch.json
+# 2) kubectl apply -f tcproute-mysql.yaml
+# 3) 数据面露出 3306：
+#    cd ../gateway-api && bash ensure-envoy-nodeport.sh
+#    # MetalLB：bash ensure-envoy-loadbalancer.sh
+# 4) kubectl get tcproute mysql -o yaml
+#    kubectl -n envoy-gateway-system get svc -l gateway.envoyproxy.io/owning-gateway-name=eg
+#
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TCPRoute
+metadata:
+  name: mysql
+  namespace: default
+spec:
+  parentRefs:
+    - name: eg
+      namespace: default
+      sectionName: mysql
+  rules:
+    - backendRefs:
+        - name: mysql
+          namespace: default
+          port: 3306
+          weight: 1

@@ -1,4 +1,6 @@
 # 业务集群：先装 Ceph CSI，再 apply Secret/ConfigMap
+# Ceph 20 + 默认 krbd 在部分 Ubuntu 内核上会 rbd map 524（add secret to kernel）
+# 改用 rbd-nbd；节点需: apt install -y linux-modules-extra-$(uname -r) ceph-common && modprobe nbd
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
@@ -8,6 +10,8 @@ parameters:
   clusterID: ceph
   pool: kubernetes
   imageFeatures: layering
+  mounter: rbd-nbd
+  mapOptions: "ms_mode=legacy"
   csi.storage.k8s.io/provisioner-secret-name: csi-rbd-secret
   csi.storage.k8s.io/provisioner-secret-namespace: ceph-csi
   csi.storage.k8s.io/controller-expand-secret-name: csi-rbd-secret

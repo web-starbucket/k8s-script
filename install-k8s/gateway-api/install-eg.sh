@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 从零安装 Gateway API(standard v1.5.1) + Envoy Gateway v1.8.2
+# 从零安装 Gateway API(standard v1.5.1 + TCPRoute CRD) + Envoy Gateway v1.8.2
 # 用法: bash install-eg.sh
 set -euo pipefail
 
@@ -255,12 +255,45 @@ kv "应用模式" "严格串行（禁止整包并行）"
 
 wait_api
 
-step 1 6 "安装 Gateway API CRD（standard ${GATEWAY_API_VERSION}）"
+step 1 6 "安装 Gateway API CRD（standard ${GATEWAY_API_VERSION} + TCPRoute）"
 download_gh "${TMPDIR}/gateway-api.yaml" \
   "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/standard-install.yaml" \
   100000
 split_and_apply "${TMPDIR}/gateway-api.yaml" "${TMPDIR}/gwapi-crds" "Gateway API CRD"
-ok "Gateway API CRD 已全部应用"
+ok "Gateway API standard CRD 已应用"
+
+# TCPRoute 在 1.5.x 仍属 experimental 包；只抽出 TCPRoute CRD，不整包 experimental（避免和 standard 冲突）
+info "从 experimental 包提取 TCPRoute CRD（MySQL 等 L4 需要）"
+download_gh "${TMPDIR}/gateway-api-exp.yaml" \
+  "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/experimental-install.yaml" \
+  100000
+python3 - "${TMPDIR}/gateway-api-exp.yaml" "${TMPDIR}/tcproute-crd.yaml" <<'PY'
+import re, sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src, encoding="utf-8").read().lstrip("\ufeff")
+parts = re.split(r"(?m)^---\s*$", text)
+keep = []
+for part in parts:
+    body = part.strip()
+    if not body:
+        continue
+    if not re.search(r"(?m)^kind:\s*CustomResourceDefinition\s*$", body):
+        continue
+    name_m = re.search(r'(?m)^  name:\s*["\']?([^"\'\s]+)["\']?\s*$', body)
+    name = name_m.group(1) if name_m else ""
+    if name in (
+        "tcproutes.gateway.networking.k8s.io",
+        "udproutes.gateway.networking.k8s.io",
+    ):
+        keep.append(body)
+if not keep:
+    sys.stderr.write("experimental 包中未找到 TCPRoute/UDPRoute CRD\n")
+    sys.exit(1)
+open(dst, "w", encoding="utf-8").write("---\n" + "\n---\n".join(keep) + "\n")
+print(len(keep))
+PY
+split_and_apply "${TMPDIR}/tcproute-crd.yaml" "${TMPDIR}/gwapi-tcproute" "TCPRoute/UDPRoute CRD"
+ok "TCPRoute CRD 已应用（kubectl get crd tcproutes.gateway.networking.k8s.io）"
 
 step 2 6 "下载 Envoy Gateway ${EG_VERSION}"
 download_gh "${TMPDIR}/install.yaml" \
@@ -343,7 +376,8 @@ kubectl -n "${NS}" get pods,svc,job -o wide
 
 done_ "安装完成" \
   "创建 Gateway 后务必执行（避免单节点可访问）:" \
-  "  bash ensure-envoy-nodeport.sh"
+  "  bash ensure-envoy-nodeport.sh" \
+  "L4: kubectl get crd tcproutes.gateway.networking.k8s.io"
 
 echo
 echo "${CG}${CB}✨ 下一步：创建入口 Gateway${C0}"

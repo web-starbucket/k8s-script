@@ -57,7 +57,7 @@ bash install-eg.sh
 ```
 
 说明：
-- 使用 Gateway API **standard** v1.5.1（不要装 experimental）
+- 使用 Gateway API **standard** v1.5.1，并**额外安装 TCPRoute/UDPRoute CRD**（从同版本 experimental 包中只抽出这两条，供 MySQL 等 L4）
 - 未设置 `IMAGE_REGISTRY` 时用官方镜像；设置后自动替换控制器与数据面镜像
 - 不依赖 `docker.io` 拉 Helm chart（直接用 GitHub release 的 install.yaml）
 - CRD / 控制器清单一律拆成**单资源文件**，**严格串行** `kubectl apply`（禁止整包并行，降低 etcd 超时）

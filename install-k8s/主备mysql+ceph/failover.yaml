@@ -1,0 +1,407 @@
+# 故障转移：谁是主就一直当主，旧主恢复后只做从库，不自动回切
+# 当前主挂掉 ≥ FAIL_AFTER → 升其它存活节点
+# Service/mysql / TCPRoute 始终跟随 mysql.role=primary
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mysql-failover
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mysql-failover
+  namespace: default
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/exec", "configmaps", "secrets"]
+    verbs: ["get", "list", "watch", "patch", "update", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mysql-failover
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: mysql-failover
+subjects:
+  - kind: ServiceAccount
+    name: mysql-failover
+    namespace: default
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-failover
+  namespace: default
+data:
+  run.sh: |
+    #!/bin/bash
+    # 长驻控制器：不用 set -e，避免 kubectl/mysql/grep 短暂失败把 Pod 打成 CrashLoop
+    set -uo pipefail
+    NS="${NAMESPACE:-default}"
+    FAIL_AFTER="${FAIL_AFTER:-1}"
+    INTERVAL="${INTERVAL:-1}"
+    PW="${MYSQL_ROOT_PASSWORD:-}"
+    REPL_PW="${MYSQL_REPLICATION_PASSWORD:-}"
+
+    log() { echo "[$(date -u +%H:%M:%S)] $*"; }
+
+    secret_b64() {
+      local sec="$1" key="$2"
+      kubectl -n "${NS}" get secret "${sec}" -o "jsonpath={.data.${key}}" 2>/dev/null || true
+    }
+    if [[ -z "${PW}" ]]; then
+      PW="$(secret_b64 mysql-auth root-password | base64 -d 2>/dev/null || true)"
+    fi
+    if [[ -z "${REPL_PW}" ]]; then
+      REPL_PW="$(secret_b64 mysql-auth replication-password | base64 -d 2>/dev/null || true)"
+    fi
+    if [[ -z "${REPL_PW}" ]]; then
+      for k in replication-password repl-password mysql-replication-password; do
+        REPL_PW="$(secret_b64 mysql-auth "${k}" | base64 -d 2>/dev/null || true)"
+        [[ -n "${REPL_PW}" ]] && break
+      done
+    fi
+    if [[ -z "${PW}" || -z "${REPL_PW}" ]]; then
+      log "ERROR 缺少 root/replication 密码。Secret mysql-auth 需要 key: root-password + replication-password"
+      log "修复: kubectl apply -f mysql.yaml && kubectl apply -f failover.yaml && kubectl rollout restart deploy/mysql-failover"
+      kubectl -n "${NS}" get secret mysql-auth -o jsonpath='{.data}' 2>/dev/null; echo
+      sleep 30
+      exit 1
+    fi
+    down_since=""
+    connect_watch=""
+    connect_wm=""
+    last_status=""
+
+    pod_ready() {
+      local p="$1"
+      [[ "$(kubectl -n "${NS}" get pod "${p}" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" == "True" ]]
+    }
+
+    list_mysql() {
+      kubectl -n "${NS}" get pods -l app=mysql \
+        -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | sort || true
+    }
+
+    cm_get() {
+      kubectl -n "${NS}" get cm mysql-topology -o jsonpath="{.data.$1}" 2>/dev/null | tr -d '[:space:]'
+    }
+
+    current_pod() {
+      local p first
+      p="$(cm_get primary-pod)"
+      if [[ -n "${p}" ]]; then echo "${p}"; return; fi
+      first="$(list_mysql | head -1)"
+      echo "${first:-mysql-0}"
+    }
+
+    set_primary_pod() {
+      kubectl -n "${NS}" patch cm mysql-topology --type merge \
+        -p "{\"data\":{\"primary-pod\":\"$1\"}}" >/dev/null
+    }
+
+    mysql_ping() {
+      kubectl -n "${NS}" exec "$1" -c mysql -- \
+        mysqladmin --protocol=SOCKET --socket=/var/run/mysqld/mysqld.sock \
+        ping -uroot -p"${PW}" --silent >/dev/null 2>&1
+    }
+
+    mysql_exec() {
+      kubectl -n "${NS}" exec "$1" -c mysql -- \
+        mysql --protocol=SOCKET --socket=/var/run/mysqld/mysqld.sock \
+        -uroot -p"${PW}" -N -e "$2"
+    }
+
+    mysql_alive() { pod_ready "$1" && mysql_ping "$1"; }
+
+    set_role() {
+      local p="$1" want="$2" cur
+      cur="$(kubectl -n "${NS}" get pod "${p}" -o jsonpath='{.metadata.labels.mysql\.role}' 2>/dev/null || true)"
+      [[ "${cur}" == "${want}" ]] && return 0
+      kubectl -n "${NS}" label pod "${p}" "mysql.role=${want}" --overwrite >/dev/null 2>&1 || true
+    }
+
+    sync_labels() {
+      local want p
+      want="$(current_pod)"
+      for p in $(list_mysql); do
+        [[ -n "${p}" ]] || continue
+        if [[ "${p}" == "${want}" ]]; then set_role "${p}" primary
+        else set_role "${p}" replica
+        fi
+      done
+    }
+
+    ensure_root_password() {
+      local pod="$1"
+      if kubectl -n "${NS}" exec "${pod}" -c mysql -- \
+        mysql --protocol=SOCKET --socket=/var/run/mysqld/mysqld.sock \
+        -uroot -p"${PW}" -e "SELECT 1" >/dev/null 2>&1; then
+        return 0
+      fi
+      log "warn ${pod} Secret 密码登录失败，尝试空密码并重置为 Secret"
+      if kubectl -n "${NS}" exec "${pod}" -c mysql -- \
+        mysql --protocol=SOCKET --socket=/var/run/mysqld/mysqld.sock \
+        -uroot -e "
+          SET GLOBAL super_read_only=OFF;
+          SET GLOBAL read_only=OFF;
+          ALTER USER 'root'@'localhost' IDENTIFIED BY '${PW}';
+          CREATE USER IF NOT EXISTS 'root'@'%' IDENTIFIED BY '${PW}';
+          ALTER USER 'root'@'%' IDENTIFIED BY '${PW}';
+          GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' WITH GRANT OPTION;
+          CREATE USER IF NOT EXISTS 'root'@'127.0.0.1' IDENTIFIED BY '${PW}';
+          ALTER USER 'root'@'127.0.0.1' IDENTIFIED BY '${PW}';
+          GRANT ALL PRIVILEGES ON *.* TO 'root'@'127.0.0.1' WITH GRANT OPTION;
+          FLUSH PRIVILEGES;" >/dev/null 2>&1; then
+        log "warn ${pod} root 密码已重置为 Secret"
+        return 0
+      fi
+      log "error ${pod} 无法用 Secret/空密码登录 root，请删 PVC 重建: kubectl delete pvc data-${pod}"
+      return 1
+    }
+
+    point_replica_to() {
+      local pod="$1" src="$2"
+      mysql_alive "${pod}" || return 1
+      ensure_root_password "${pod}" || return 1
+      if ! mysql_exec "${pod}" "
+        STOP REPLICA;
+        SET GLOBAL super_read_only=OFF;
+        SET GLOBAL read_only=OFF;
+        RESET REPLICA ALL;
+        CHANGE REPLICATION SOURCE TO
+          SOURCE_HOST='${src}.mysql-hl',
+          SOURCE_PORT=3306,
+          SOURCE_USER='repl',
+          SOURCE_PASSWORD='${REPL_PW}',
+          SOURCE_AUTO_POSITION=1,
+          GET_SOURCE_PUBLIC_KEY=1;
+        START REPLICA;
+        SET GLOBAL read_only=ON;
+        SET GLOBAL super_read_only=ON;"; then
+        log "复制失败  ${pod} → ${src}.mysql-hl"
+        return 1
+      fi
+      log "复制已指向  ${pod} → ${src}.mysql-hl"
+      return 0
+    }
+
+    replica_io_on() {
+      local st
+      st="$(mysql_exec "$1" "SELECT IFNULL(SERVICE_STATE,'OFF') FROM performance_schema.replication_connection_status LIMIT 1" \
+        2>/dev/null | tr -d '\r' | grep -v 'Using a password' | tail -1 || true)"
+      [[ "${st}" == "ON" ]]
+    }
+
+    promote_to() {
+      local cand="$1" old="$2" p
+      log "故障切换  ${old:-?} → ${cand}"
+      mysql_exec "${cand}" "STOP REPLICA;" || true
+      mysql_exec "${cand}" "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;"
+      mysql_exec "${cand}" "
+        CREATE USER IF NOT EXISTS 'repl'@'%' IDENTIFIED BY '${REPL_PW}';
+        GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';
+        FLUSH PRIVILEGES;" || true
+      set_primary_pod "${cand}"
+      set_role "${cand}" primary
+      for p in $(list_mysql); do
+        [[ -n "${p}" && "${p}" != "${cand}" ]] || continue
+        set_role "${p}" replica
+        if mysql_alive "${p}"; then
+          point_replica_to "${p}" "${cand}" || log "warn ${p} 改指向失败"
+        fi
+      done
+      last_status=""
+      log "切换完成  主=${cand}（旧主恢复后仍做从库，不回切）"
+    }
+
+    pick_standby() {
+      local old p
+      old="$(current_pod)"
+      for p in $(list_mysql); do
+        [[ -n "${p}" && "${p}" != "${old}" ]] || continue
+        mysql_alive "${p}" && { echo "${p}"; return 0; }
+      done
+      return 1
+    }
+
+    replica_line() {
+      local pod="$1" row ncfg io sql src
+      if ! pod_ready "${pod}"; then echo "复制=无法查询"; return; fi
+      row="$(mysql_exec "${pod}" "SELECT CONCAT_WS('|',
+        IFNULL((SELECT COUNT(*) FROM performance_schema.replication_connection_configuration),0),
+        IFNULL((SELECT SERVICE_STATE FROM performance_schema.replication_connection_status LIMIT 1),'none'),
+        IFNULL((SELECT SERVICE_STATE FROM performance_schema.replication_applier_status LIMIT 1),'none'),
+        IFNULL((SELECT HOST FROM performance_schema.replication_connection_configuration LIMIT 1),'none'))" \
+        2>/dev/null | tr -d '\r' | grep -v 'Using a password' | tail -1 || true)"
+      IFS='|' read -r ncfg io sql src <<<"${row}"
+      if [[ "${ncfg}" == "0" || "${io}" == "none" || -z "${io}" ]]; then
+        echo "复制=未配置"; return
+      fi
+      if [[ "${io}" == "ON" && "${sql}" == "ON" ]]; then
+        echo "复制=正常 IO=${io} SQL=${sql} 源=${src}"
+      else
+        echo "复制=异常 IO=${io} SQL=${sql} 源=${src}"
+      fi
+    }
+
+    print_roles() {
+      local cur p ready rpl line
+      cur="$(current_pod)"
+      line="主 ${cur}"
+      for p in $(list_mysql); do
+        [[ -n "${p}" ]] || continue
+        if pod_ready "${p}"; then ready="Ready"; else ready="NotReady"; fi
+        if [[ "${p}" == "${cur}" ]]; then
+          line="${line} ${ready}"
+        else
+          rpl="$(replica_line "${p}")"
+          line="${line}  |  从 ${p} ${ready} ${rpl}"
+        fi
+      done
+      if [[ "${line}" != "${last_status}" ]]; then
+        log "${line}"
+        last_status="${line}"
+      fi
+    }
+
+    mysql_out() { grep -v 'Using a password' | tr -d '\r' || true; }
+
+    sync_connect_log() {
+      local pri p lines line ev wm
+      pri="$(current_pod)"
+      mysql_alive "${pri}" || return 0
+      mysql_exec "${pri}" "SET GLOBAL log_output='TABLE'; SET GLOBAL general_log=1;" >/dev/null 2>&1 || true
+      for p in $(list_mysql); do
+        [[ -n "${p}" && "${p}" != "${pri}" ]] || continue
+        mysql_alive "${p}" || continue
+        mysql_exec "${p}" "SET GLOBAL general_log=0;" >/dev/null 2>&1 || true
+      done
+      if [[ "${connect_watch}" != "${pri}" ]]; then
+        connect_watch="${pri}"
+        connect_wm="$(mysql_exec "${pri}" "SELECT DATE_FORMAT(IFNULL(MAX(event_time),NOW(6)),'%Y-%m-%d %H:%i:%s.%f') FROM mysql.general_log" 2>/dev/null | mysql_out | tail -1 || true)"
+        connect_wm="$(echo "${connect_wm:-}" | tr -cd '0-9.: -')"
+        [[ -n "${connect_wm}" ]] || connect_wm="1970-01-01 00:00:00.000000"
+        log "监听客户端连接  主=${pri}"
+        return 0
+      fi
+      wm="$(echo "${connect_wm}" | tr -cd '0-9.: -')"
+      lines="$(mysql_exec "${pri}" "SELECT CONCAT_WS('|', DATE_FORMAT(event_time,'%Y-%m-%d %H:%i:%s.%f'), REPLACE(user_host,'|','/'), REPLACE(IFNULL(argument,''),'|','/')) FROM mysql.general_log WHERE command_type='Connect' AND event_time>'${wm}' AND user_host NOT LIKE '%localhost%' AND user_host NOT LIKE '%127.0.0.1%' AND user_host NOT LIKE 'repl[%' ORDER BY event_time ASC LIMIT 50" 2>/dev/null | mysql_out || true)"
+      while IFS= read -r line; do
+        [[ -n "${line}" ]] || continue
+        [[ "${line}" == *"ERROR"* ]] && continue
+        ev="${line%%|*}"
+        log "客户端连接  主=${pri}  ${line#*|}"
+        connect_wm="${ev}"
+      done <<< "${lines:-}"
+    }
+
+    ensure_replicas() {
+      local cur p ncfg
+      cur="$(current_pod)"
+      mysql_alive "${cur}" || return 0
+      for p in $(list_mysql); do
+        [[ -n "${p}" && "${p}" != "${cur}" ]] || continue
+        pod_ready "${p}" || continue
+        if ! ensure_root_password "${p}"; then
+          log "ensure ${p} root 密码无法对齐，跳过（可 bash fix-root-password.sh ${p} 或删 PVC）"
+          continue
+        fi
+        ncfg="$(mysql_exec "${p}" "SELECT COUNT(*) FROM performance_schema.replication_connection_configuration" 2>/dev/null | tr -d '\r' | grep -v 'Using a password' | tail -1 || true)"
+        ncfg="$(echo "${ncfg:-0}" | tr -cd '0-9')"
+        [[ -n "${ncfg}" ]] || ncfg=0
+        if [[ "${ncfg}" == "0" ]] || ! replica_io_on "${p}"; then
+          log "ensure ${p} 复制未就绪 → 指向 ${cur}"
+          point_replica_to "${p}" "${cur}" || log "ensure ${p} 配置失败"
+        fi
+      done
+    }
+
+    log "启动  ns=${NS}  fail_after=${FAIL_AFTER}s  interval=${INTERVAL}s  策略=故障才切主、不回切"
+    while true; do
+      sync_labels || true
+      print_roles || true
+      if mysql_alive "$(current_pod)"; then
+        down_since=""
+        ensure_replicas || true
+        sync_connect_log || true
+      else
+        now="$(date +%s)"
+        if [[ -z "${down_since}" ]]; then
+          down_since="${now}"
+          last_status=""
+          log "主库不可用  $(current_pod)  开始计时"
+        elif (( now - down_since >= FAIL_AFTER )); then
+          cand="$(pick_standby || true)"
+          if [[ -n "${cand}" ]]; then
+            log "主库不可用≥${FAIL_AFTER}s，升主 ${cand}"
+            promote_to "${cand}" "$(current_pod)" || true
+          else
+            log "无可用从库可升主"
+          fi
+          down_since=""
+          last_status=""
+          print_roles || true
+        else
+          log "等待升主  $((now - down_since))/${FAIL_AFTER}s"
+        fi
+      fi
+      sleep "${INTERVAL}"
+    done
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql-failover
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql-failover
+  template:
+    metadata:
+      labels:
+        app: mysql-failover
+    spec:
+      serviceAccountName: mysql-failover
+      containers:
+        - name: controller
+          image: registry.cn-global.starbucket.com.cn/starbucket/docker.io/alpine/k8s:1.33.1
+          imagePullPolicy: IfNotPresent
+          command: ["bash", "/scripts/run.sh"]
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: FAIL_AFTER
+              value: "1"
+            - name: INTERVAL
+              value: "1"
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-auth
+                  key: root-password
+                  optional: true
+            - name: MYSQL_REPLICATION_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-auth
+                  key: replication-password
+                  optional: true
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: scripts
+          configMap:
+            name: mysql-failover
+            defaultMode: 0755

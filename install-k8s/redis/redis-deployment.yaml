@@ -1,0 +1,67 @@
+# 无状态 Redis。上线前改 REDIS_PASSWORD。
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: redis
+  namespace: default
+type: Opaque
+stringData:
+  REDIS_USER: app
+  REDIS_PASSWORD: "CHANGE_ME"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: default
+spec:
+  type: ClusterIP
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: registry.cn-global.starbucket.com.cn/starbucket/docker.io/library/redis:8
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              hash=$(printf '%s' "$REDIS_PASSWORD" | sha256sum | awk '{print $1}')
+              printf 'save ""\nappendonly no\nrequirepass %s\nuser %s on #%s ~* &* +@all\n' \
+                "$REDIS_PASSWORD" "$REDIS_USER" "$hash" > /tmp/redis.conf
+              exec redis-server /tmp/redis.conf
+          env:
+            - name: REDIS_USER
+              valueFrom:
+                secretKeyRef:
+                  name: redis
+                  key: REDIS_USER
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis
+                  key: REDIS_PASSWORD
+          ports:
+            - containerPort: 6379
+              name: redis

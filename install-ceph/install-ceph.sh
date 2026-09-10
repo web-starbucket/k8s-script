@@ -719,6 +719,96 @@ apply_dashboard_monitoring_ip() {
   else
     warn "Dashboard 监控 URL 未写上（Grafana 可能还在拉起，稍后重跑 bootstrap 或 add-hosts）"
   fi
+  silence_cephfs_alerts "http://${aip}:${aport}"
+}
+
+# RBD 集群无 MDS；Prometheus 默认规则会误报 CephFS。在 Alertmanager 长期静默。
+silence_cephfs_alerts() {
+  local am="${1:-}"
+  [[ "${SKIP_MONITORING_STACK}" == "1" ]] && return 0
+  if [[ -z "${am}" ]]; then
+    local line host port ip
+    line="$(orch_daemon_host_port alertmanager 9093 || true)"
+    host="$(awk '{print $1}' <<<"${line}")"
+    port="$(awk '{print $2}' <<<"${line}")"
+    ip="$(bootstrap_ip)"
+    [[ -n "${host}" ]] && ip="$(node_ip_by_name "${host}")"
+    [[ -n "${ip}" ]] || ip="$(bootstrap_ip)"
+    [[ -n "${port}" ]] || port=9093
+    am="http://${ip}:${port}"
+  fi
+  item "静默 CephFS/MDS 告警  ${am}"
+  if python3 - "${am}" <<'PY'
+import json, sys, urllib.error, urllib.request
+from datetime import datetime, timedelta, timezone
+
+base = sys.argv[1].rstrip("/")
+comment = "install-ceph.sh:silence-cephfs"
+now = datetime.now(timezone.utc).replace(microsecond=0)
+end = now + timedelta(days=3650)
+
+def req(method, path, data=None):
+    url = base + path
+    body = None if data is None else json.dumps(data).encode()
+    r = urllib.request.Request(url, data=body, method=method)
+    r.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(r, timeout=8) as resp:
+        raw = resp.read().decode()
+        return json.loads(raw) if raw else None
+
+try:
+    silences = req("GET", "/api/v2/silences") or []
+except urllib.error.URLError as e:
+    print("ALERTMANAGER_UNREACHABLE", e, file=sys.stderr)
+    sys.exit(2)
+
+for s in silences:
+    st = (s.get("status") or {}).get("state") or ""
+    if st == "active" and comment in (s.get("comment") or ""):
+        print("EXISTS")
+        sys.exit(0)
+
+payload = {
+    "matchers": [
+        {"name": "alertname", "value": "CephFilesystem.*", "isRegex": True, "isEqual": True},
+    ],
+    "startsAt": now.isoformat().replace("+00:00", "Z"),
+    "endsAt": end.isoformat().replace("+00:00", "Z"),
+    "createdBy": "install-ceph.sh",
+    "comment": comment + " (RBD-only, no MDS)",
+}
+try:
+    req("POST", "/api/v2/silences", payload)
+except urllib.error.HTTPError as e:
+    # 部分版本 matcher 不认 isEqual
+    payload["matchers"] = [{"name": "alertname", "value": "CephFilesystem.*", "isRegex": True}]
+    try:
+        req("POST", "/api/v2/silences", payload)
+    except Exception as e2:
+        print("POST_FAILED", e, e2, file=sys.stderr)
+        sys.exit(1)
+print("CREATED")
+PY
+  then
+    ok "CephFS 告警已静默（约 10 年；规则仍在列表里，但不再 firing）"
+  else
+    warn "Alertmanager 未静默成功，可稍后: sudo bash $0 alerts cephfs-off"
+    warn "或浏览器打开 ${am} → Silences，alertname =~ CephFilesystem.*"
+  fi
+}
+
+cmd_alerts() {
+  need_root alerts
+  local sub="${1:-cephfs-off}"
+  case "${sub}" in
+    cephfs-off|cephfs)
+      step "alerts  cephfs-off"
+      silence_cephfs_alerts
+      ;;
+    *)
+      err "用法: $0 alerts cephfs-off"
+      ;;
+  esac
 }
 
 cmd_bootstrap() {
@@ -1269,6 +1359,7 @@ cmd_help() {
       pool           创建 RBD 池与 client.kubernetes
       status         ceph -s / host / osd tree
       device-health  磁盘 SMART：off（virtio 默认）| on（物理盘）| status
+      alerts         静默误报：alerts cephfs-off（RBD 集群无关 CephFS/MDS）
       destroy         卸载集群；--all 清全部节点（拆 LVM + wipe OSD 盘，加 --yes）
       destroy-local   只清本机（同样初始化数据盘）
 
@@ -1454,6 +1545,17 @@ EOF
 
 EOF
       ;;
+    alerts)
+      cat <<EOF
+
+  命令  alerts
+  ────────────────────────────────
+  作用  在 Alertmanager 静默 CephFS/MDS 误报（本集群只做 RBD，无文件系统）
+  用法  sudo bash ${bin} alerts cephfs-off
+  说明  规则仍会出现在列表里，但不再 Firing；bootstrap/add-hosts 也会自动静默
+
+EOF
+      ;;
     destroy|destroy-local)
       cat <<EOF
 
@@ -1533,6 +1635,7 @@ main() {
     pool)           cmd_pool "$@" ;;
     status)         cmd_status "$@" ;;
     device-health)  cmd_device_health "$@" ;;
+    alerts)         cmd_alerts "$@" ;;
     destroy)        cmd_destroy "$@" ;;
     destroy-local)  cmd_destroy_local "$@" ;;
     export-rbd)     cmd_export_rbd "$@" ;;

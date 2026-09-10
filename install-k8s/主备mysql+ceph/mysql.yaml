@@ -1,0 +1,292 @@
+# 单个 StatefulSet + 多副本；每副本一块 ceph-rbd
+# 镜像：官方 mysql:8（非 Bitnami）
+# 首次初始化由自定义 entrypoint 立刻写入 Secret 密码（不把空 root 留给业务）
+# Service/mysql → mysql.role=primary；TCPRoute 指向该 Service
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mysql-auth
+  namespace: default
+type: Opaque
+stringData:
+  root-password: "123456"
+  replication-password: "123456"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-topology
+  namespace: default
+data:
+  # 当前主；failover 故障切换时改这里。谁当主就一直当主，不自动回切。
+  primary-pod: "mysql-0"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-bootstrap
+  namespace: default
+data:
+  entrypoint.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    : "${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD required}"
+    : "${MYSQL_REPLICATION_PASSWORD:?MYSQL_REPLICATION_PASSWORD required}"
+
+    PRIMARY_POD="$(tr -d '[:space:]' </etc/mysql-topology/primary-pod)"
+    HOST="${HOSTNAME:-$(cat /etc/hostname 2>/dev/null || echo unknown)}"
+    ORDINAL="${HOST##*-}"
+    SERVER_ID=$((ORDINAL + 1))
+    DATADIR="/var/lib/mysql"
+    MYSQL_SOCK="${MYSQL_UNIX_PORT:-/var/run/mysqld/mysqld.sock}"
+    mkdir -p /etc/mysql/conf.d /var/run/mysqld
+    chown -R mysql:mysql /var/run/mysqld 2>/dev/null || true
+
+    write_repl_cnf() {
+      if [[ "$1" == "primary" ]]; then
+        printf '%s\n' \
+          '[mysqld]' \
+          "server-id=${SERVER_ID}" \
+          'log-bin=mysql-bin' \
+          'log_replica_updates=ON' \
+          'binlog_expire_logs_seconds=604800' \
+          'gtid_mode=ON' \
+          'enforce_gtid_consistency=ON' \
+          'bind-address=0.0.0.0' \
+          'skip_name_resolve=ON' \
+          >/etc/mysql/conf.d/repl.cnf
+      else
+        printf '%s\n' \
+          '[mysqld]' \
+          "server-id=${SERVER_ID}" \
+          'log-bin=mysql-bin' \
+          'log_replica_updates=ON' \
+          'binlog_expire_logs_seconds=604800' \
+          'gtid_mode=ON' \
+          'enforce_gtid_consistency=ON' \
+          'read_only=ON' \
+          'super_read_only=ON' \
+          'relay_log=relay-bin' \
+          'bind-address=0.0.0.0' \
+          'skip_name_resolve=ON' \
+          >/etc/mysql/conf.d/repl.cnf
+      fi
+    }
+
+    if [[ "${HOST}" == "${PRIMARY_POD}" ]]; then
+      echo "role=primary host=${HOST} server-id=${SERVER_ID}"
+      write_repl_cnf primary
+    else
+      echo "role=replica host=${HOST} master=${PRIMARY_POD} server-id=${SERVER_ID}"
+      write_repl_cnf replica
+    fi
+
+    MYSQL_LOCAL=(mysql --protocol=SOCKET --socket="${MYSQL_SOCK}" -uroot -p"${MYSQL_ROOT_PASSWORD}")
+    MYSQLADMIN_LOCAL=(mysqladmin --protocol=SOCKET --socket="${MYSQL_SOCK}" -uroot -p"${MYSQL_ROOT_PASSWORD}")
+
+    # 首次初始化：MySQL 只支持 insecure(空)/initialize(随机)。
+    # 我们用 insecure 后立刻 ALTER 成 Secret，再关临时实例；业务启动时已是自定义密码。
+    if [[ ! -d "${DATADIR}/mysql" ]]; then
+      echo "custom init: datadir + set root/repl from Secret immediately"
+      mysqld --initialize-insecure --datadir="${DATADIR}" --user=mysql
+      chown -R mysql:mysql "${DATADIR}"
+
+      mysqld --user=mysql --datadir="${DATADIR}" \
+        --skip-networking \
+        --socket="${MYSQL_SOCK}" \
+        --pid-file=/var/run/mysqld/mysqld.pid \
+        --super-read-only=OFF --read-only=OFF &
+      mysql_pid=$!
+      for i in $(seq 1 60); do
+        mysqladmin --protocol=SOCKET --socket="${MYSQL_SOCK}" -uroot ping --silent && break
+        sleep 1
+      done
+      mysqladmin --protocol=SOCKET --socket="${MYSQL_SOCK}" -uroot ping --silent
+
+      mysql --protocol=SOCKET --socket="${MYSQL_SOCK}" -uroot -e "
+        ALTER USER 'root'@'localhost' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';
+        CREATE USER IF NOT EXISTS 'root'@'%' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';
+        ALTER USER 'root'@'%' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';
+        GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' WITH GRANT OPTION;
+        CREATE USER IF NOT EXISTS 'root'@'127.0.0.1' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';
+        ALTER USER 'root'@'127.0.0.1' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';
+        GRANT ALL PRIVILEGES ON *.* TO 'root'@'127.0.0.1' WITH GRANT OPTION;
+        CREATE USER IF NOT EXISTS 'repl'@'%' IDENTIFIED BY '${MYSQL_REPLICATION_PASSWORD}';
+        GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';
+        FLUSH PRIVILEGES;"
+      echo "custom init: root/repl = Secret（不再是空密码）"
+
+      if [[ "${HOST}" != "${PRIMARY_POD}" ]]; then
+        echo "custom init: wait ${PRIMARY_POD}.mysql-hl"
+        for i in $(seq 1 90); do
+          (echo >/dev/tcp/${PRIMARY_POD}.mysql-hl/3306) >/dev/null 2>&1 && break
+          sleep 2
+        done
+        mysql --protocol=SOCKET --socket="${MYSQL_SOCK}" -uroot -p"${MYSQL_ROOT_PASSWORD}" -e "
+          CHANGE REPLICATION SOURCE TO
+            SOURCE_HOST='${PRIMARY_POD}.mysql-hl',
+            SOURCE_PORT=3306,
+            SOURCE_USER='repl',
+            SOURCE_PASSWORD='${MYSQL_REPLICATION_PASSWORD}',
+            SOURCE_AUTO_POSITION=1,
+            GET_SOURCE_PUBLIC_KEY=1;
+          START REPLICA;"
+        echo "custom init: replica → ${PRIMARY_POD}.mysql-hl"
+      fi
+
+      mysqladmin --protocol=SOCKET --socket="${MYSQL_SOCK}" -uroot -p"${MYSQL_ROOT_PASSWORD}" shutdown
+      wait "${mysql_pid}" 2>/dev/null || true
+      echo "custom init: done"
+    else
+      # 已有数据：后台对齐密码/复制
+      (
+        for i in $(seq 1 90); do
+          "${MYSQLADMIN_LOCAL[@]}" ping --silent && break
+          mysqladmin --protocol=SOCKET --socket="${MYSQL_SOCK}" -uroot ping --silent && break
+          sleep 2
+        done
+        if ! "${MYSQL_LOCAL[@]}" -e "SELECT 1" >/dev/null 2>&1; then
+          echo "warn: Secret 不通，空密码重置 root"
+          mysql --protocol=SOCKET --socket="${MYSQL_SOCK}" -uroot -e "
+            SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;
+            ALTER USER 'root'@'localhost' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';
+            CREATE USER IF NOT EXISTS 'root'@'%' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';
+            ALTER USER 'root'@'%' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';
+            GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' WITH GRANT OPTION;
+            FLUSH PRIVILEGES;" || true
+        fi
+        if [[ "${HOST}" == "${PRIMARY_POD}" ]]; then
+          "${MYSQL_LOCAL[@]}" -e "
+            SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;
+            GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' WITH GRANT OPTION;
+            CREATE USER IF NOT EXISTS 'repl'@'%' IDENTIFIED BY '${MYSQL_REPLICATION_PASSWORD}';
+            GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%'; FLUSH PRIVILEGES;" || true
+        else
+          for i in $(seq 1 60); do
+            (echo >/dev/tcp/${PRIMARY_POD}.mysql-hl/3306) >/dev/null 2>&1 && break
+            sleep 2
+          done
+          "${MYSQL_LOCAL[@]}" -e "
+            STOP REPLICA;
+            SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;
+            CHANGE REPLICATION SOURCE TO
+              SOURCE_HOST='${PRIMARY_POD}.mysql-hl', SOURCE_PORT=3306,
+              SOURCE_USER='repl', SOURCE_PASSWORD='${MYSQL_REPLICATION_PASSWORD}',
+              SOURCE_AUTO_POSITION=1, GET_SOURCE_PUBLIC_KEY=1;
+            START REPLICA;
+            SET GLOBAL read_only=ON; SET GLOBAL super_read_only=ON;" || true
+        fi
+      ) &
+    fi
+
+    exec docker-entrypoint.sh mysqld
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-hl
+  namespace: default
+  labels:
+    app: mysql
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: mysql
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: mysql
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: default
+  labels:
+    app: mysql
+spec:
+  type: ClusterIP
+  selector:
+    app: mysql
+    mysql.role: primary
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: mysql
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+  namespace: default
+spec:
+  serviceName: mysql-hl
+  replicas: 2
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+        - name: mysql
+          image: registry.cn-global.starbucket.com.cn/starbucket/docker.io/library/mysql:8
+          command: ["bash", "/bootstrap/entrypoint.sh"]
+          ports:
+            - name: mysql
+              containerPort: 3306
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-auth
+                  key: root-password
+            - name: MYSQL_REPLICATION_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-auth
+                  key: replication-password
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+            - name: bootstrap
+              mountPath: /bootstrap
+              readOnly: true
+            - name: topology
+              mountPath: /etc/mysql-topology
+              readOnly: true
+          readinessProbe:
+            exec:
+              command:
+                - bash
+                - -c
+                - mysqladmin --protocol=SOCKET --socket=/var/run/mysqld/mysqld.sock ping -uroot -p"$MYSQL_ROOT_PASSWORD" --silent
+            initialDelaySeconds: 40
+            periodSeconds: 10
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+      volumes:
+        - name: bootstrap
+          configMap:
+            name: mysql-bootstrap
+            defaultMode: 0755
+        - name: topology
+          configMap:
+            name: mysql-topology
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: ceph-rbd
+        resources:
+          requests:
+            storage: 10Gi
