@@ -319,7 +319,7 @@ data:
       done
     }
 
-    log "启动  ns=${NS}  fail_after=${FAIL_AFTER}s  interval=${INTERVAL}s  策略=故障才切主、不回切"
+    log "启动  ns=${NS}  fail_after=${FAIL_AFTER}s  interval=${INTERVAL}s  策略=故障自动切换主库"
     while true; do
       sync_labels || true
       print_roles || true
