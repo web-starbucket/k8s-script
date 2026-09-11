@@ -172,7 +172,7 @@ data:
         SET GLOBAL read_only=OFF;
         RESET REPLICA ALL;
         CHANGE REPLICATION SOURCE TO
-          SOURCE_HOST='${src}.mysql-hl',
+          SOURCE_HOST='${src}.mysql-headless',
           SOURCE_PORT=3306,
           SOURCE_USER='repl',
           SOURCE_PASSWORD='${REPL_PW}',
@@ -181,10 +181,10 @@ data:
         START REPLICA;
         SET GLOBAL read_only=ON;
         SET GLOBAL super_read_only=ON;"; then
-        log "复制失败  ${pod} → ${src}.mysql-hl"
+        log "复制失败  ${pod} → ${src}.mysql-headless"
         return 1
       fi
-      log "复制已指向  ${pod} → ${src}.mysql-hl"
+      log "复制已指向  ${pod} → ${src}.mysql-headless"
       return 0
     }
 

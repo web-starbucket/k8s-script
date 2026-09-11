@@ -22,7 +22,7 @@ if kubectl -n "${NS}" get pod "${OLD}" >/dev/null 2>&1; then
       STOP REPLICA;
       SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;
       CHANGE REPLICATION SOURCE TO
-        SOURCE_HOST='${NEW}.mysql-hl', SOURCE_PORT=3306,
+        SOURCE_HOST='${NEW}.mysql-headless', SOURCE_PORT=3306,
         SOURCE_USER='repl', SOURCE_PASSWORD='${REPL_PW}',
         SOURCE_AUTO_POSITION=1, GET_SOURCE_PUBLIC_KEY=1;
       START REPLICA;

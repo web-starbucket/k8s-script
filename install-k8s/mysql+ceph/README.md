@@ -12,7 +12,7 @@ kubectl logs -f deploy/mysql-controller
 状态行仅在变化时打印，例如：
 
 ```text
-[08:24:08] 主 mysql-0 Ready  |  从 mysql-1 Ready 复制=正常 IO=ON SQL=ON 源=mysql-0.mysql-hl
+[08:24:08] 主 mysql-0 Ready  |  从 mysql-1 Ready 复制=正常 IO=ON SQL=ON 源=mysql-0.mysql-headless
 ```
 
 ### 2. 测故障转移
@@ -32,11 +32,6 @@ kubectl get ep mysql
 ```
 SELECT @@hostname, @@read_only, @@super_read_only;
 ```
-
-`mysql-0` 被 STS 拉起后会成为从库，**不会**再切回 `mysql-0`。要手工切回：`bash promote-replica.sh mysql-0`
-
-三副本时把 STS `replicas: 3`，挂掉当前主会升其它存活节点。
-
 
 
 ### 3. 在线修改数据库账号密码

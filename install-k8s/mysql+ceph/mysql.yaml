@@ -15,7 +15,7 @@ metadata:
   name: mysql-topology
   namespace: default
 data:
-  # 当前主；failover 故障切换时改这里。谁当主就一直当主，不自动回切。
+  # 当前主；failover 故障切换时改这里
   primary-pod: "mysql-0"
 ---
 apiVersion: v1
@@ -114,21 +114,21 @@ data:
       echo "custom init: root/repl = Secret（不再是空密码）"
 
       if [[ "${HOST}" != "${PRIMARY_POD}" ]]; then
-        echo "custom init: wait ${PRIMARY_POD}.mysql-hl"
+        echo "custom init: wait ${PRIMARY_POD}.mysql-headless"
         for i in $(seq 1 90); do
-          (echo >/dev/tcp/${PRIMARY_POD}.mysql-hl/3306) >/dev/null 2>&1 && break
+          (echo >/dev/tcp/${PRIMARY_POD}.mysql-headless/3306) >/dev/null 2>&1 && break
           sleep 2
         done
         mysql --protocol=SOCKET --socket="${MYSQL_SOCK}" -uroot -p"${MYSQL_ROOT_PASSWORD}" -e "
           CHANGE REPLICATION SOURCE TO
-            SOURCE_HOST='${PRIMARY_POD}.mysql-hl',
+            SOURCE_HOST='${PRIMARY_POD}.mysql-headless',
             SOURCE_PORT=3306,
             SOURCE_USER='repl',
             SOURCE_PASSWORD='${MYSQL_REPLICATION_PASSWORD}',
             SOURCE_AUTO_POSITION=1,
             GET_SOURCE_PUBLIC_KEY=1;
           START REPLICA;"
-        echo "custom init: replica → ${PRIMARY_POD}.mysql-hl"
+        echo "custom init: replica → ${PRIMARY_POD}.mysql-headless"
       fi
 
       mysqladmin --protocol=SOCKET --socket="${MYSQL_SOCK}" -uroot -p"${MYSQL_ROOT_PASSWORD}" shutdown
@@ -160,14 +160,14 @@ data:
             GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%'; FLUSH PRIVILEGES;" || true
         else
           for i in $(seq 1 60); do
-            (echo >/dev/tcp/${PRIMARY_POD}.mysql-hl/3306) >/dev/null 2>&1 && break
+            (echo >/dev/tcp/${PRIMARY_POD}.mysql-headless/3306) >/dev/null 2>&1 && break
             sleep 2
           done
           "${MYSQL_LOCAL[@]}" -e "
             STOP REPLICA;
             SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;
             CHANGE REPLICATION SOURCE TO
-              SOURCE_HOST='${PRIMARY_POD}.mysql-hl', SOURCE_PORT=3306,
+              SOURCE_HOST='${PRIMARY_POD}.mysql-headless', SOURCE_PORT=3306,
               SOURCE_USER='repl', SOURCE_PASSWORD='${MYSQL_REPLICATION_PASSWORD}',
               SOURCE_AUTO_POSITION=1, GET_SOURCE_PUBLIC_KEY=1;
             START REPLICA;
@@ -181,7 +181,7 @@ data:
 apiVersion: v1
 kind: Service
 metadata:
-  name: mysql-hl
+  name: mysql-headless
   namespace: default
   labels:
     app: mysql
@@ -218,7 +218,7 @@ metadata:
   name: mysql
   namespace: default
 spec:
-  serviceName: mysql-hl
+  serviceName: mysql-headless
   replicas: 2
   podManagementPolicy: OrderedReady
   selector:
