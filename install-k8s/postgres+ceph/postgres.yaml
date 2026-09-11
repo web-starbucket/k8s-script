@@ -1,0 +1,309 @@
+# StatefulSet + ceph-rbd；流复制主备 + Service/postgres 只选当前主
+# 故障切换由 postgres-controller 负责；谁升主就一直当主，不回切
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-auth
+  namespace: default
+type: Opaque
+stringData:
+  POSTGRES_DB: obsbot
+  POSTGRES_USER: obsbot
+  POSTGRES_PASSWORD: "CHANGE_ME"
+  replication-password: "CHANGE_ME"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-topology
+  namespace: default
+data:
+  # 当前主；postgres-controller 故障切换时改这里
+  primary-pod: "postgres-0"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-bootstrap
+  namespace: default
+data:
+  init-replication.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    psql -v ON_ERROR_STOP=1 --username "${POSTGRES_USER}" --dbname "${POSTGRES_DB}" <<-EOSQL
+      DO \$body\$ BEGIN
+        CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD '${POSTGRES_REPLICATION_PASSWORD}';
+      EXCEPTION WHEN duplicate_object THEN
+        ALTER ROLE replicator WITH REPLICATION LOGIN PASSWORD '${POSTGRES_REPLICATION_PASSWORD}';
+      END \$body\$;
+    EOSQL
+    printf '%s\n' \
+      'host replication replicator 10.0.0.0/8 scram-sha-256' \
+      'host replication replicator 172.16.0.0/12 scram-sha-256' \
+      'host replication replicator 192.168.0.0/16 scram-sha-256' \
+      >>"${PGDATA}/pg_hba.conf"
+  entrypoint.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    : "${POSTGRES_USER:?POSTGRES_USER required}"
+    : "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}"
+    : "${POSTGRES_DB:?POSTGRES_DB required}"
+    : "${POSTGRES_REPLICATION_PASSWORD:?POSTGRES_REPLICATION_PASSWORD required}"
+
+    PRIMARY_POD="$(tr -d '[:space:]' </etc/postgres-topology/primary-pod)"
+    HOST="${HOSTNAME:-$(cat /etc/hostname 2>/dev/null || echo unknown)}"
+    PGROOT="/var/lib/postgresql/data"
+    PGDATA="${PGDATA:-${PGROOT}/pgdata}"
+    export PGDATA
+
+    PG_ARGS=(
+      postgres
+      -c max_connections=200
+      -c shared_buffers=1GB
+      -c effective_cache_size=4GB
+      -c work_mem=16MB
+      -c maintenance_work_mem=256MB
+      -c wal_buffers=64MB
+      -c checkpoint_completion_target=0.9
+      -c min_wal_size=512MB
+      -c max_wal_size=2GB
+      -c max_worker_processes=8
+      -c max_parallel_workers=4
+      -c max_parallel_workers_per_gather=2
+      -c max_parallel_maintenance_workers=2
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+      -c huge_pages=off
+      -c log_min_duration_statement=1000
+      -c log_checkpoints=on
+      -c log_lock_waits=on
+      -c listen_addresses='*'
+      -c wal_level=replica
+      -c max_wal_senders=10
+      -c max_replication_slots=10
+      -c hot_standby=on
+    )
+
+    wait_primary() {
+      export PGPASSWORD="${POSTGRES_REPLICATION_PASSWORD}"
+      for i in $(seq 1 90); do
+        pg_isready -h "${PRIMARY_POD}.postgres-headless" -p 5432 -U replicator >/dev/null 2>&1 && return 0
+        sleep 2
+      done
+      echo "timeout: ${PRIMARY_POD}.postgres-headless:5432"
+      return 1
+    }
+
+    sync_from_primary() {
+      export PGPASSWORD="${POSTGRES_REPLICATION_PASSWORD}"
+      local src="${PRIMARY_POD}.postgres-headless"
+      mkdir -p "${PGROOT}" "${PGDATA}"
+      if [[ -f "${PGDATA}/PG_VERSION" && ! -f "${PGDATA}/standby.signal" ]]; then
+        echo "sync: pg_rewind ${HOST} → ${src}"
+        gosu postgres pg_ctl stop -D "${PGDATA}" -m fast 2>/dev/null || true
+        if ! gosu postgres pg_rewind -D "${PGDATA}" \
+          --source-server="host=${src} port=5432 user=replicator dbname=postgres"; then
+          echo "sync: pg_rewind 失败，改用 pg_basebackup"
+          rm -rf "${PGDATA:?}"/*
+          gosu postgres pg_basebackup -h "${src}" -p 5432 -U replicator \
+            -D "${PGDATA}" -Fp -Xs -P -R
+        else
+          gosu postgres touch "${PGDATA}/standby.signal"
+        fi
+      else
+        echo "sync: pg_basebackup ${HOST} ← ${src}"
+        rm -rf "${PGDATA:?}"/*
+        gosu postgres pg_basebackup -h "${src}" -p 5432 -U replicator \
+          -D "${PGDATA}" -Fp -Xs -P -R
+      fi
+    }
+
+    ensure_replicator_on_primary() {
+      (
+        for i in $(seq 1 90); do
+          pg_isready -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" >/dev/null 2>&1 && break
+          sleep 2
+        done
+        psql -v ON_ERROR_STOP=0 -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" <<-EOSQL
+          DO \$body\$ BEGIN
+            CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD '${POSTGRES_REPLICATION_PASSWORD}';
+          EXCEPTION WHEN duplicate_object THEN
+            ALTER ROLE replicator WITH REPLICATION LOGIN PASSWORD '${POSTGRES_REPLICATION_PASSWORD}';
+          END \$body\$;
+        EOSQL
+      ) &
+    }
+
+    if [[ "${HOST}" == "${PRIMARY_POD}" ]]; then
+      echo "role=primary host=${HOST}"
+      if [[ ! -f "${PGDATA}/PG_VERSION" ]]; then
+        export POSTGRES_INITDB_ARGS="${POSTGRES_INITDB_ARGS:---data-checksums}"
+        mkdir -p /docker-entrypoint-initdb.d
+        cp /bootstrap/init-replication.sh /docker-entrypoint-initdb.d/00-replication.sh
+        chmod +x /docker-entrypoint-initdb.d/00-replication.sh
+      else
+        ensure_replicator_on_primary
+      fi
+      exec docker-entrypoint.sh "${PG_ARGS[@]}"
+    fi
+
+    echo "role=replica host=${HOST} master=${PRIMARY_POD}"
+    if [[ ! -f "${PGDATA}/PG_VERSION" ]]; then
+      wait_primary
+      sync_from_primary
+    elif [[ ! -f "${PGDATA}/standby.signal" ]]; then
+      wait_primary
+      sync_from_primary
+    fi
+    exec docker-entrypoint.sh "${PG_ARGS[@]}"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-headless
+  namespace: default
+  labels:
+    app: postgres
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: postgres
+  ports:
+    - name: pg
+      port: 5432
+      targetPort: pg
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: default
+  labels:
+    app: postgres
+spec:
+  type: ClusterIP
+  selector:
+    app: postgres
+    postgres.role: primary
+  ports:
+    - name: pg
+      port: 5432
+      targetPort: pg
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: default
+  labels:
+    app: postgres
+spec:
+  serviceName: postgres-headless
+  replicas: 2
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      securityContext:
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: postgres
+          image: registry.cn-global.starbucket.com.cn/starbucket/docker.io/library/postgres:16
+          imagePullPolicy: IfNotPresent
+          command: ["bash", "/bootstrap/entrypoint.sh"]
+          ports:
+            - name: pg
+              containerPort: 5432
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-auth
+                  key: POSTGRES_DB
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-auth
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-auth
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_REPLICATION_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-auth
+                  key: replication-password
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: bootstrap
+              mountPath: /bootstrap
+              readOnly: true
+            - name: topology
+              mountPath: /etc/postgres-topology
+              readOnly: true
+            - name: shm
+              mountPath: /dev/shm
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 10
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+            initialDelaySeconds: 40
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 250m
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          securityContext:
+            runAsUser: 999
+            runAsGroup: 999
+      volumes:
+        - name: bootstrap
+          configMap:
+            name: postgres-bootstrap
+            defaultMode: 0755
+        - name: topology
+          configMap:
+            name: postgres-topology
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Gi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: ceph-rbd
+        resources:
+          requests:
+            storage: 20Gi

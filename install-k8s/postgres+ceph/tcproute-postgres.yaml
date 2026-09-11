@@ -1,0 +1,26 @@
+# PostgreSQL TCP 入口：Gateway listener postgres:5432 → Service/postgres（仅 postgres.role=primary）
+#
+# 1) Gateway 增加 listener（若已有 name=postgres 可忽略报错）：
+#    kubectl patch gateway eg -n default --type=json --patch='[
+#      {"op":"add","path":"/spec/listeners/-","value":{
+#        "name":"postgres","protocol":"TCP","port":5432,
+#        "allowedRoutes":{"kinds":[{"kind":"TCPRoute","group":"gateway.networking.k8s.io"}]}}}]'
+# 2) kubectl apply -f tcproute-postgres.yaml
+# 3) cd ../gateway-api && bash ensure-envoy-nodeport.sh
+#
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TCPRoute
+metadata:
+  name: postgres
+  namespace: default
+spec:
+  parentRefs:
+    - name: eg
+      namespace: default
+      sectionName: postgres
+  rules:
+    - backendRefs:
+        - name: postgres
+          namespace: default
+          port: 5432
+          weight: 1

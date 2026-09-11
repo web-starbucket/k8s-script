@@ -1,0 +1,316 @@
+# 故障转移：当前主不可用 → 升备库；谁升主就一直当主，不回切
+# Service/postgres / TCPRoute 跟随 postgres.role=primary
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: postgres-controller
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: postgres-controller
+  namespace: default
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/exec", "configmaps", "secrets"]
+    verbs: ["get", "list", "watch", "patch", "update", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: postgres-controller
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: postgres-controller
+subjects:
+  - kind: ServiceAccount
+    name: postgres-controller
+    namespace: default
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-controller
+  namespace: default
+data:
+  run.sh: |
+    #!/bin/bash
+    set -uo pipefail
+    NS="${NAMESPACE:-default}"
+    FAIL_AFTER="${FAIL_AFTER:-1}"
+    INTERVAL="${INTERVAL:-1}"
+    DB="${POSTGRES_DB:-}"
+    USER="${POSTGRES_USER:-}"
+    PW="${POSTGRES_PASSWORD:-}"
+    REPL_PW="${POSTGRES_REPLICATION_PASSWORD:-}"
+
+    log() { echo "[$(date -u +%H:%M:%S)] $*"; }
+
+    secret_b64() {
+      local sec="$1" key="$2"
+      kubectl -n "${NS}" get secret "${sec}" -o "jsonpath={.data.${key}}" 2>/dev/null || true
+    }
+    [[ -z "${DB}" ]] && DB="$(secret_b64 postgres-auth POSTGRES_DB | base64 -d 2>/dev/null || true)"
+    [[ -z "${USER}" ]] && USER="$(secret_b64 postgres-auth POSTGRES_USER | base64 -d 2>/dev/null || true)"
+    [[ -z "${PW}" ]] && PW="$(secret_b64 postgres-auth POSTGRES_PASSWORD | base64 -d 2>/dev/null || true)"
+    [[ -z "${REPL_PW}" ]] && REPL_PW="$(secret_b64 postgres-auth replication-password | base64 -d 2>/dev/null || true)"
+    if [[ -z "${DB}" || -z "${USER}" || -z "${PW}" || -z "${REPL_PW}" ]]; then
+      log "ERROR 缺少 postgres-auth：POSTGRES_DB/POSTGRES_USER/POSTGRES_PASSWORD/replication-password"
+      kubectl -n "${NS}" get secret postgres-auth -o jsonpath='{.data}' 2>/dev/null; echo
+      sleep 30
+      exit 1
+    fi
+    down_since=""
+    last_status=""
+
+    pod_ready() {
+      local p="$1"
+      [[ "$(kubectl -n "${NS}" get pod "${p}" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" == "True" ]]
+    }
+
+    list_postgres() {
+      kubectl -n "${NS}" get pods -l app=postgres \
+        -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | sort || true
+    }
+
+    cm_get() {
+      kubectl -n "${NS}" get cm postgres-topology -o jsonpath="{.data.$1}" 2>/dev/null | tr -d '[:space:]'
+    }
+
+    current_pod() {
+      local p first
+      p="$(cm_get primary-pod)"
+      if [[ -n "${p}" ]]; then echo "${p}"; return; fi
+      first="$(list_postgres | head -1)"
+      echo "${first:-postgres-0}"
+    }
+
+    set_primary_pod() {
+      kubectl -n "${NS}" patch cm postgres-topology --type merge \
+        -p "{\"data\":{\"primary-pod\":\"$1\"}}" >/dev/null
+    }
+
+    pg_ready() {
+      kubectl -n "${NS}" exec "$1" -c postgres -- \
+        pg_isready -U "${USER}" -d "${DB}" >/dev/null 2>&1
+    }
+
+    psql() {
+      kubectl -n "${NS}" exec "$1" -c postgres -- \
+        psql -v ON_ERROR_STOP=1 -U "${USER}" -d "${DB}" -tA "$2" 2>/dev/null \
+        | tr -d '\r' || true
+    }
+
+    pg_alive() { pod_ready "$1" && pg_ready "$1"; }
+
+    is_standby() {
+      [[ "$(psql "$1" "SELECT pg_is_in_recovery();")" == "t" ]]
+    }
+
+    set_role() {
+      local p="$1" want="$2" cur
+      cur="$(kubectl -n "${NS}" get pod "${p}" -o jsonpath='{.metadata.labels.postgres\.role}' 2>/dev/null || true)"
+      [[ "${cur}" == "${want}" ]] && return 0
+      kubectl -n "${NS}" label pod "${p}" "postgres.role=${want}" --overwrite >/dev/null 2>&1 || true
+    }
+
+    sync_labels() {
+      local want p
+      want="$(current_pod)"
+      for p in $(list_postgres); do
+        [[ -n "${p}" ]] || continue
+        if [[ "${p}" == "${want}" ]]; then set_role "${p}" primary
+        else set_role "${p}" replica
+        fi
+      done
+    }
+
+    replica_streaming() {
+      local st
+      st="$(psql "$1" "SELECT COALESCE(status,'') FROM pg_stat_wal_receiver LIMIT 1;")"
+      [[ "${st}" == "streaming" ]]
+    }
+
+    resync_replica() {
+      local pod="$1" src="$2"
+      log "重建从库  ${pod} → ${src}.postgres-headless（删除 Pod 触发 pg_basebackup/pg_rewind）"
+      kubectl -n "${NS}" delete pod "${pod}" --wait=false >/dev/null 2>&1 || true
+    }
+
+    promote_to() {
+      local cand="$1" old="$2" p
+      log "故障切换  ${old:-?} → ${cand}"
+      if is_standby "${cand}"; then
+        psql "${cand}" "SELECT pg_promote();" >/dev/null || true
+        sleep 2
+      fi
+      set_primary_pod "${cand}"
+      set_role "${cand}" primary
+      for p in $(list_postgres); do
+        [[ -n "${p}" && "${p}" != "${cand}" ]] || continue
+        set_role "${p}" replica
+        resync_replica "${p}" "${cand}"
+      done
+      last_status=""
+      log "切换完成  主=${cand}（旧主恢复后仍做从库，不回切）"
+    }
+
+    pick_standby() {
+      local old p
+      old="$(current_pod)"
+      for p in $(list_postgres); do
+        [[ -n "${p}" && "${p}" != "${old}" ]] || continue
+        pg_alive "${p}" && is_standby "${p}" && { echo "${p}"; return 0; }
+      done
+      for p in $(list_postgres); do
+        [[ -n "${p}" && "${p}" != "${old}" ]] || continue
+        pg_alive "${p}" && { echo "${p}"; return 0; }
+      done
+      return 1
+    }
+
+    replica_line() {
+      local pod="$1" st host
+      if ! pod_ready "${pod}"; then echo "复制=无法查询"; return; fi
+      if ! is_standby "${pod}"; then echo "复制=未配置"; return; fi
+      st="$(psql "${pod}" "SELECT COALESCE(status,'') FROM pg_stat_wal_receiver LIMIT 1;")"
+      host="$(psql "${pod}" "SELECT COALESCE(split_part(conninfo,'host=',2),'') FROM pg_stat_wal_receiver LIMIT 1;" | cut -d' ' -f1)"
+      if [[ "${st}" == "streaming" ]]; then
+        echo "复制=正常 status=${st} 源=${host:-unknown}"
+      else
+        echo "复制=异常 status=${st:-none} 源=${host:-none}"
+      fi
+    }
+
+    print_roles() {
+      local cur p ready rpl line
+      cur="$(current_pod)"
+      line="主 ${cur}"
+      for p in $(list_postgres); do
+        [[ -n "${p}" ]] || continue
+        if pod_ready "${p}"; then ready="Ready"; else ready="NotReady"; fi
+        if [[ "${p}" == "${cur}" ]]; then
+          line="${line} ${ready}"
+        else
+          rpl="$(replica_line "${p}")"
+          line="${line}  |  从 ${p} ${ready} ${rpl}"
+        fi
+      done
+      if [[ "${line}" != "${last_status}" ]]; then
+        log "${line}"
+        last_status="${line}"
+      fi
+    }
+
+    ensure_replicas() {
+      local cur p
+      cur="$(current_pod)"
+      pg_alive "${cur}" || return 0
+      for p in $(list_postgres); do
+        [[ -n "${p}" && "${p}" != "${cur}" ]] || continue
+        pod_ready "${p}" || continue
+        if ! is_standby "${p}" || ! replica_streaming "${p}"; then
+          log "ensure ${p} 复制未就绪 → 指向 ${cur}"
+          resync_replica "${p}" "${cur}"
+        fi
+      done
+    }
+
+    log "启动  ns=${NS}  fail_after=${FAIL_AFTER}s  interval=${INTERVAL}s  策略=故障才切主、不回切"
+    while true; do
+      sync_labels || true
+      print_roles || true
+      if pg_alive "$(current_pod)"; then
+        down_since=""
+        ensure_replicas || true
+      else
+        now="$(date +%s)"
+        if [[ -z "${down_since}" ]]; then
+          down_since="${now}"
+          last_status=""
+          log "主库不可用  $(current_pod)  开始计时"
+        elif (( now - down_since >= FAIL_AFTER )); then
+          cand="$(pick_standby || true)"
+          if [[ -n "${cand}" ]]; then
+            log "主库不可用≥${FAIL_AFTER}s，升主 ${cand}"
+            promote_to "${cand}" "$(current_pod)" || true
+          else
+            log "无可用备库可升主"
+          fi
+          down_since=""
+          last_status=""
+          print_roles || true
+        else
+          log "等待升主  $((now - down_since))/${FAIL_AFTER}s"
+        fi
+      fi
+      sleep "${INTERVAL}"
+    done
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-controller
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-controller
+  template:
+    metadata:
+      labels:
+        app: postgres-controller
+    spec:
+      serviceAccountName: postgres-controller
+      containers:
+        - name: controller
+          image: registry.cn-global.starbucket.com.cn/starbucket/docker.io/alpine/k8s:1.33.1
+          imagePullPolicy: IfNotPresent
+          command: ["bash", "/scripts/run.sh"]
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: FAIL_AFTER
+              value: "1"
+            - name: INTERVAL
+              value: "1"
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-auth
+                  key: POSTGRES_DB
+                  optional: true
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-auth
+                  key: POSTGRES_USER
+                  optional: true
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-auth
+                  key: POSTGRES_PASSWORD
+                  optional: true
+            - name: POSTGRES_REPLICATION_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-auth
+                  key: replication-password
+                  optional: true
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: scripts
+          configMap:
+            name: postgres-controller
+            defaultMode: 0755
