@@ -43,6 +43,9 @@ data:
     NS="${NAMESPACE:-default}"
     FAIL_AFTER="${FAIL_AFTER:-1}"
     INTERVAL="${INTERVAL:-1}"
+    REPLICA_GRACE_SEC="${REPLICA_GRACE_SEC:-120}"
+    RESYNC_FAILS="${RESYNC_FAILS:-3}"
+    RESYNC_COOLDOWN_SEC="${RESYNC_COOLDOWN_SEC:-300}"
     DB="${POSTGRES_DB:-}"
     USER="${POSTGRES_USER:-}"
     PW="${POSTGRES_PASSWORD:-}"
@@ -66,6 +69,9 @@ data:
     fi
     down_since=""
     last_status=""
+    declare -A repl_fail=()
+    declare -A repl_resync_at=()
+    declare -A repl_ready_since=()
 
     pod_ready() {
       local p="$1"
@@ -99,16 +105,53 @@ data:
         pg_isready -U "${USER}" -d "${DB}" >/dev/null 2>&1
     }
 
-    psql() {
+    psql_q() {
       kubectl -n "${NS}" exec "$1" -c postgres -- \
-        psql -v ON_ERROR_STOP=1 -U "${USER}" -d "${DB}" -tA "$2" 2>/dev/null \
-        | tr -d '\r' || true
+        psql -U "${USER}" -d "${DB}" -tA -c "$2" 2>/dev/null \
+        | tr -d '\r\n' || true
     }
 
     pg_alive() { pod_ready "$1" && pg_ready "$1"; }
 
+    pod_ip() {
+      kubectl -n "${NS}" get pod "$1" -o jsonpath='{.status.podIP}' 2>/dev/null | tr -d '[:space:]'
+    }
+
+    track_replica_ready() {
+      local p="$1" now
+      now="$(date +%s)"
+      if pod_ready "${p}"; then
+        [[ -n "${repl_ready_since[$p]:-}" ]] || repl_ready_since[$p]="${now}"
+      else
+        unset 'repl_ready_since[$p]'
+      fi
+    }
+
+    replica_in_grace() {
+      local p="$1" since now
+      since="${repl_ready_since[$p]:-}"
+      [[ -n "${since}" ]] || return 0
+      now="$(date +%s)"
+      (( now - since < REPLICA_GRACE_SEC ))
+    }
+
     is_standby() {
-      [[ "$(psql "$1" "SELECT pg_is_in_recovery();")" == "t" ]]
+      [[ "$(psql_q "$1" "SELECT pg_is_in_recovery();")" == "t" ]]
+    }
+
+    replica_on_primary() {
+      local pri="$1" rep="$2" ip state
+      ip="$(pod_ip "${rep}")"
+      [[ -n "${ip}" ]] || return 1
+      state="$(psql_q "${pri}" "SELECT COALESCE(state,'') FROM pg_stat_replication WHERE client_addr = '${ip}'::inet LIMIT 1;")"
+      [[ "${state}" == "streaming" ]]
+    }
+
+    replica_healthy() {
+      local pri="$1" rep="$2"
+      is_standby "${rep}" || return 1
+      replica_on_primary "${pri}" "${rep}" || return 1
+      return 0
     }
 
     set_role() {
@@ -129,14 +172,17 @@ data:
       done
     }
 
-    replica_streaming() {
-      local st
-      st="$(psql "$1" "SELECT COALESCE(status,'') FROM pg_stat_wal_receiver LIMIT 1;")"
-      [[ "${st}" == "streaming" ]]
-    }
-
     resync_replica() {
-      local pod="$1" src="$2"
+      local pod="$1" src="$2" now last
+      now="$(date +%s)"
+      last="${repl_resync_at[$pod]:-0}"
+      if (( now - last < RESYNC_COOLDOWN_SEC )); then
+        log "跳过重建  ${pod} 冷却中 $((RESYNC_COOLDOWN_SEC - now + last))s"
+        return 0
+      fi
+      repl_resync_at[$pod]="${now}"
+      repl_fail[$pod]=0
+      unset 'repl_ready_since[$pod]'
       log "重建从库  ${pod} → ${src}.postgres-headless（删除 Pod 触发 pg_basebackup/pg_rewind）"
       kubectl -n "${NS}" delete pod "${pod}" --wait=false >/dev/null 2>&1 || true
     }
@@ -145,7 +191,7 @@ data:
       local cand="$1" old="$2" p
       log "故障切换  ${old:-?} → ${cand}"
       if is_standby "${cand}"; then
-        psql "${cand}" "SELECT pg_promote();" >/dev/null || true
+        psql_q "${cand}" "SELECT pg_promote();" >/dev/null || true
         sleep 2
       fi
       set_primary_pod "${cand}"
@@ -174,15 +220,17 @@ data:
     }
 
     replica_line() {
-      local pod="$1" st host
+      local pod="$1" cur st host pri_state
+      cur="$(current_pod)"
       if ! pod_ready "${pod}"; then echo "复制=无法查询"; return; fi
       if ! is_standby "${pod}"; then echo "复制=未配置"; return; fi
-      st="$(psql "${pod}" "SELECT COALESCE(status,'') FROM pg_stat_wal_receiver LIMIT 1;")"
-      host="$(psql "${pod}" "SELECT COALESCE(split_part(conninfo,'host=',2),'') FROM pg_stat_wal_receiver LIMIT 1;" | cut -d' ' -f1)"
-      if [[ "${st}" == "streaming" ]]; then
+      st="$(psql_q "${pod}" "SELECT COALESCE(status,'') FROM pg_stat_wal_receiver LIMIT 1;")"
+      host="$(psql_q "${pod}" "SELECT COALESCE(sender_host,'') FROM pg_stat_wal_receiver LIMIT 1;")"
+      pri_state="$(psql_q "${cur}" "SELECT COALESCE(state,'') FROM pg_stat_replication WHERE client_addr = '$(pod_ip "${pod}")'::inet LIMIT 1;")"
+      if [[ "${st}" == "streaming" && "${pri_state}" == "streaming" ]]; then
         echo "复制=正常 status=${st} 源=${host:-unknown}"
       else
-        echo "复制=异常 status=${st:-none} 源=${host:-none}"
+        echo "复制=异常 status=${st:-none} 主看=${pri_state:-none} 源=${host:-none}"
       fi
     }
 
@@ -207,20 +255,31 @@ data:
     }
 
     ensure_replicas() {
-      local cur p
+      local cur p fails
       cur="$(current_pod)"
       pg_alive "${cur}" || return 0
       for p in $(list_postgres); do
         [[ -n "${p}" && "${p}" != "${cur}" ]] || continue
+        track_replica_ready "${p}"
         pod_ready "${p}" || continue
-        if ! is_standby "${p}" || ! replica_streaming "${p}"; then
-          log "ensure ${p} 复制未就绪 → 指向 ${cur}"
+        if replica_in_grace "${p}"; then
+          repl_fail[$p]=0
+          continue
+        fi
+        if replica_healthy "${cur}" "${p}"; then
+          repl_fail[$p]=0
+          continue
+        fi
+        fails=$(( ${repl_fail[$p]:-0} + 1 ))
+        repl_fail[$p]="${fails}"
+        log "ensure ${p} 复制未就绪 ${fails}/${RESYNC_FAILS} standby=$(is_standby "${p}" && echo t || echo f) 主库state=$(psql_q "${cur}" "SELECT COALESCE(state,'') FROM pg_stat_replication WHERE client_addr = '$(pod_ip "${p}")'::inet LIMIT 1;")"
+        if (( fails >= RESYNC_FAILS )); then
           resync_replica "${p}" "${cur}"
         fi
       done
     }
 
-    log "启动  ns=${NS}  fail_after=${FAIL_AFTER}s  interval=${INTERVAL}s  策略=故障才切主、不回切"
+    log "启动  ns=${NS}  fail_after=${FAIL_AFTER}s  interval=${INTERVAL}s  grace=${REPLICA_GRACE_SEC}s  策略=故障才切主、不回切"
     while true; do
       sync_labels || true
       print_roles || true
@@ -281,6 +340,12 @@ spec:
               value: "1"
             - name: INTERVAL
               value: "1"
+            - name: REPLICA_GRACE_SEC
+              value: "120"
+            - name: RESYNC_FAILS
+              value: "3"
+            - name: RESYNC_COOLDOWN_SEC
+              value: "300"
             - name: POSTGRES_DB
               valueFrom:
                 secretKeyRef:

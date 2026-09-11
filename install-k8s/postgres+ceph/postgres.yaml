@@ -10,8 +10,8 @@ type: Opaque
 stringData:
   POSTGRES_DB: obsbot
   POSTGRES_USER: obsbot
-  POSTGRES_PASSWORD: "CHANGE_ME"
-  replication-password: "CHANGE_ME"
+  POSTGRES_PASSWORD: "123456"
+  replication-password: "123456"
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -31,13 +31,12 @@ data:
   init-replication.sh: |
     #!/bin/bash
     set -euo pipefail
-    psql -v ON_ERROR_STOP=1 --username "${POSTGRES_USER}" --dbname "${POSTGRES_DB}" <<-EOSQL
-      DO \$body\$ BEGIN
-        CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD '${POSTGRES_REPLICATION_PASSWORD}';
-      EXCEPTION WHEN duplicate_object THEN
-        ALTER ROLE replicator WITH REPLICATION LOGIN PASSWORD '${POSTGRES_REPLICATION_PASSWORD}';
-      END \$body\$;
-    EOSQL
+    psql -v ON_ERROR_STOP=1 --username "${POSTGRES_USER}" --dbname "${POSTGRES_DB}" -c \
+      "DO \$\$ BEGIN
+         CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD '${POSTGRES_REPLICATION_PASSWORD}';
+       EXCEPTION WHEN duplicate_object THEN
+         ALTER ROLE replicator WITH REPLICATION LOGIN PASSWORD '${POSTGRES_REPLICATION_PASSWORD}';
+       END \$\$;"
     printf '%s\n' \
       'host replication replicator 10.0.0.0/8 scram-sha-256' \
       'host replication replicator 172.16.0.0/12 scram-sha-256' \
@@ -99,24 +98,11 @@ data:
       export PGPASSWORD="${POSTGRES_REPLICATION_PASSWORD}"
       local src="${PRIMARY_POD}.postgres-headless"
       mkdir -p "${PGROOT}" "${PGDATA}"
-      if [[ -f "${PGDATA}/PG_VERSION" && ! -f "${PGDATA}/standby.signal" ]]; then
-        echo "sync: pg_rewind ${HOST} → ${src}"
-        gosu postgres pg_ctl stop -D "${PGDATA}" -m fast 2>/dev/null || true
-        if ! gosu postgres pg_rewind -D "${PGDATA}" \
-          --source-server="host=${src} port=5432 user=replicator dbname=postgres"; then
-          echo "sync: pg_rewind 失败，改用 pg_basebackup"
-          rm -rf "${PGDATA:?}"/*
-          gosu postgres pg_basebackup -h "${src}" -p 5432 -U replicator \
-            -D "${PGDATA}" -Fp -Xs -P -R
-        else
-          gosu postgres touch "${PGDATA}/standby.signal"
-        fi
-      else
-        echo "sync: pg_basebackup ${HOST} ← ${src}"
-        rm -rf "${PGDATA:?}"/*
-        gosu postgres pg_basebackup -h "${src}" -p 5432 -U replicator \
-          -D "${PGDATA}" -Fp -Xs -P -R
-      fi
+      # replicator 非 superuser，pg_rewind 会报 pg_read_binary_file 权限错误；统一 basebackup
+      echo "sync: pg_basebackup ${HOST} ← ${src}"
+      rm -rf "${PGDATA:?}"/*
+      pg_basebackup -h "${src}" -p 5432 -U replicator \
+        -D "${PGDATA}" -Fp -Xs -P -R
     }
 
     ensure_replicator_on_primary() {
@@ -125,13 +111,12 @@ data:
           pg_isready -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" >/dev/null 2>&1 && break
           sleep 2
         done
-        psql -v ON_ERROR_STOP=0 -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" <<-EOSQL
-          DO \$body\$ BEGIN
-            CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD '${POSTGRES_REPLICATION_PASSWORD}';
-          EXCEPTION WHEN duplicate_object THEN
-            ALTER ROLE replicator WITH REPLICATION LOGIN PASSWORD '${POSTGRES_REPLICATION_PASSWORD}';
-          END \$body\$;
-        EOSQL
+        psql -v ON_ERROR_STOP=0 -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -c \
+          "DO \$\$ BEGIN
+             CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD '${POSTGRES_REPLICATION_PASSWORD}';
+           EXCEPTION WHEN duplicate_object THEN
+             ALTER ROLE replicator WITH REPLICATION LOGIN PASSWORD '${POSTGRES_REPLICATION_PASSWORD}';
+           END \$\$;" || true
       ) &
     }
 
@@ -139,9 +124,6 @@ data:
       echo "role=primary host=${HOST}"
       if [[ ! -f "${PGDATA}/PG_VERSION" ]]; then
         export POSTGRES_INITDB_ARGS="${POSTGRES_INITDB_ARGS:---data-checksums}"
-        mkdir -p /docker-entrypoint-initdb.d
-        cp /bootstrap/init-replication.sh /docker-entrypoint-initdb.d/00-replication.sh
-        chmod +x /docker-entrypoint-initdb.d/00-replication.sh
       else
         ensure_replicator_on_primary
       fi
@@ -250,6 +232,10 @@ spec:
               mountPath: /var/lib/postgresql/data
             - name: bootstrap
               mountPath: /bootstrap
+              readOnly: true
+            - name: bootstrap
+              mountPath: /docker-entrypoint-initdb.d/00-replication.sh
+              subPath: init-replication.sh
               readOnly: true
             - name: topology
               mountPath: /etc/postgres-topology
