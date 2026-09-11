@@ -1,0 +1,26 @@
+# Redis TCP 入口：Gateway listener redis:6379 → Service/redis（仅 redis.role=primary）
+#
+# 1) Gateway 增加 listener（若已有 name=redis 可忽略报错）：
+#    kubectl patch gateway eg -n default --type=json --patch='[
+#      {"op":"add","path":"/spec/listeners/-","value":{
+#        "name":"redis","protocol":"TCP","port":6379,
+#        "allowedRoutes":{"kinds":[{"kind":"TCPRoute","group":"gateway.networking.k8s.io"}]}}}]'
+# 2) kubectl apply -f tcproute-redis.yaml
+# 3) cd ../gateway-api && bash ensure-envoy-nodeport.sh
+#
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TCPRoute
+metadata:
+  name: redis
+  namespace: default
+spec:
+  parentRefs:
+    - name: eg
+      namespace: default
+      sectionName: redis
+  rules:
+    - backendRefs:
+        - name: redis
+          namespace: default
+          port: 6379
+          weight: 1

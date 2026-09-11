@@ -1,0 +1,192 @@
+# StatefulSet + ceph-rbd；主从复制 + Service/redis 只选当前主
+# 故障切换由 redis-controller 负责；谁升主就一直当主，不回切
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: redis-auth
+  namespace: default
+type: Opaque
+stringData:
+  password: "123456"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-topology
+  namespace: default
+data:
+  # 当前主；redis-controller 故障切换时改这里
+  primary-pod: "redis-0"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-bootstrap
+  namespace: default
+data:
+  entrypoint.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    : "${REDIS_PASSWORD:?REDIS_PASSWORD required}"
+
+    PRIMARY_POD="$(tr -d '[:space:]' </etc/redis-topology/primary-pod)"
+    HOST="${HOSTNAME:-$(cat /etc/hostname 2>/dev/null || echo unknown)}"
+    DATADIR="/data"
+    CONF="${DATADIR}/redis.conf"
+    CLI=(redis-cli -a "${REDIS_PASSWORD}" --no-auth-warning)
+
+    mkdir -p "${DATADIR}"
+
+    write_conf() {
+      local role="$1"
+      printf '%s\n' \
+        "dir ${DATADIR}" \
+        'appendonly yes' \
+        'appendfsync everysec' \
+        "requirepass ${REDIS_PASSWORD}" \
+        "masterauth ${REDIS_PASSWORD}" \
+        'bind 0.0.0.0' \
+        'protected-mode no' \
+        'port 6379' \
+        >"${CONF}"
+      if [[ "${role}" == "replica" ]]; then
+        printf '%s\n' \
+          "replicaof ${PRIMARY_POD}.redis-headless 6379" \
+          'replica-read-only yes' \
+          >>"${CONF}"
+      fi
+    }
+
+    if [[ "${HOST}" == "${PRIMARY_POD}" ]]; then
+      echo "role=primary host=${HOST}"
+      write_conf primary
+    else
+      echo "role=replica host=${HOST} master=${PRIMARY_POD}"
+      write_conf replica
+    fi
+
+    # 已有数据：后台按 topology 对齐主从（Pod 重启 / 故障切换后）
+    if [[ -f "${DATADIR}/appendonly.aof" || -f "${DATADIR}/dump.rdb" || -f "${CONF}" ]]; then
+      (
+        for i in $(seq 1 60); do
+          "${CLI[@]}" ping 2>/dev/null | grep -q PONG && break
+          sleep 2
+        done
+        if [[ "${HOST}" == "${PRIMARY_POD}" ]]; then
+          "${CLI[@]}" REPLICAOF NO ONE 2>/dev/null || true
+        else
+          for i in $(seq 1 90); do
+            (echo >/dev/tcp/${PRIMARY_POD}.redis-headless/6379) >/dev/null 2>&1 && break
+            sleep 2
+          done
+          "${CLI[@]}" REPLICAOF "${PRIMARY_POD}.redis-headless" 6379 2>/dev/null || true
+        fi
+      ) &
+    fi
+
+    exec redis-server "${CONF}"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-headless
+  namespace: default
+  labels:
+    app: redis
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: default
+  labels:
+    app: redis
+spec:
+  type: ClusterIP
+  selector:
+    app: redis
+    redis.role: primary
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: default
+spec:
+  serviceName: redis-headless
+  replicas: 2
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: registry.cn-global.starbucket.com.cn/starbucket/docker.io/library/redis:8
+          command: ["bash", "/bootstrap/entrypoint.sh"]
+          ports:
+            - name: redis
+              containerPort: 6379
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-auth
+                  key: password
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: bootstrap
+              mountPath: /bootstrap
+              readOnly: true
+            - name: topology
+              mountPath: /etc/redis-topology
+              readOnly: true
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - redis-cli -a "$REDIS_PASSWORD" --no-auth-warning ping | grep -q PONG
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+      volumes:
+        - name: bootstrap
+          configMap:
+            name: redis-bootstrap
+            defaultMode: 0755
+        - name: topology
+          configMap:
+            name: redis-topology
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: ceph-rbd
+        resources:
+          requests:
+            storage: 5Gi

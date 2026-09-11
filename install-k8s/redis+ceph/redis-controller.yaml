@@ -1,0 +1,317 @@
+# 故障转移：当前主不可用 → 升从库；谁升主就一直当主，不回切
+# Service/redis / TCPRoute 跟随 redis.role=primary
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: redis-controller
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: redis-controller
+  namespace: default
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/exec", "configmaps", "secrets"]
+    verbs: ["get", "list", "watch", "patch", "update", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: redis-controller
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: redis-controller
+subjects:
+  - kind: ServiceAccount
+    name: redis-controller
+    namespace: default
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-controller
+  namespace: default
+data:
+  run.sh: |
+    #!/bin/bash
+    set -uo pipefail
+    NS="${NAMESPACE:-default}"
+    FAIL_AFTER="${FAIL_AFTER:-1}"
+    INTERVAL="${INTERVAL:-1}"
+    PW="${REDIS_PASSWORD:-}"
+
+    log() { echo "[$(date -u +%H:%M:%S)] $*"; }
+
+    secret_b64() {
+      local sec="$1" key="$2"
+      kubectl -n "${NS}" get secret "${sec}" -o "jsonpath={.data.${key}}" 2>/dev/null || true
+    }
+    if [[ -z "${PW}" ]]; then
+      PW="$(secret_b64 redis-auth password | base64 -d 2>/dev/null || true)"
+    fi
+    if [[ -z "${PW}" ]]; then
+      for k in password redis-password REDIS_PASSWORD; do
+        PW="$(secret_b64 redis-auth "${k}" | base64 -d 2>/dev/null || true)"
+        [[ -n "${PW}" ]] && break
+      done
+    fi
+    if [[ -z "${PW}" ]]; then
+      log "ERROR 缺少 Redis 密码。Secret redis-auth 需要 key: password"
+      log "修复: kubectl apply -f redis.yaml && kubectl apply -f redis-controller.yaml && kubectl rollout restart deploy/redis-controller"
+      kubectl -n "${NS}" get secret redis-auth -o jsonpath='{.data}' 2>/dev/null; echo
+      sleep 30
+      exit 1
+    fi
+    down_since=""
+    last_status=""
+
+    pod_ready() {
+      local p="$1"
+      [[ "$(kubectl -n "${NS}" get pod "${p}" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" == "True" ]]
+    }
+
+    list_redis() {
+      kubectl -n "${NS}" get pods -l app=redis \
+        -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | sort || true
+    }
+
+    cm_get() {
+      kubectl -n "${NS}" get cm redis-topology -o jsonpath="{.data.$1}" 2>/dev/null | tr -d '[:space:]'
+    }
+
+    current_pod() {
+      local p first
+      p="$(cm_get primary-pod)"
+      if [[ -n "${p}" ]]; then echo "${p}"; return; fi
+      first="$(list_redis | head -1)"
+      echo "${first:-redis-0}"
+    }
+
+    set_primary_pod() {
+      kubectl -n "${NS}" patch cm redis-topology --type merge \
+        -p "{\"data\":{\"primary-pod\":\"$1\"}}" >/dev/null
+    }
+
+    redis_ping() {
+      kubectl -n "${NS}" exec "$1" -c redis -- \
+        redis-cli -a "${PW}" --no-auth-warning ping 2>/dev/null | grep -q PONG
+    }
+
+    redis_info() {
+      kubectl -n "${NS}" exec "$1" -c redis -- \
+        redis-cli -a "${PW}" --no-auth-warning INFO replication 2>/dev/null \
+        | tr -d '\r' | grep -v 'Warning:' || true
+    }
+
+    redis_cmd() {
+      local pod="$1"; shift
+      kubectl -n "${NS}" exec "${pod}" -c redis -- \
+        redis-cli -a "${PW}" --no-auth-warning "$@" 2>/dev/null \
+        | tr -d '\r' | grep -v 'Warning:' || true
+    }
+
+    redis_alive() { pod_ready "$1" && redis_ping "$1"; }
+
+    repl_field() {
+      local pod="$1" key="$2"
+      redis_info "${pod}" | awk -F: -v k="${key}" '$1==k {print $2; exit}' | tr -d '[:space:]'
+    }
+
+    set_role() {
+      local p="$1" want="$2" cur
+      cur="$(kubectl -n "${NS}" get pod "${p}" -o jsonpath='{.metadata.labels.redis\.role}' 2>/dev/null || true)"
+      [[ "${cur}" == "${want}" ]] && return 0
+      kubectl -n "${NS}" label pod "${p}" "redis.role=${want}" --overwrite >/dev/null 2>&1 || true
+    }
+
+    sync_labels() {
+      local want p
+      want="$(current_pod)"
+      for p in $(list_redis); do
+        [[ -n "${p}" ]] || continue
+        if [[ "${p}" == "${want}" ]]; then set_role "${p}" primary
+        else set_role "${p}" replica
+        fi
+      done
+    }
+
+    replica_link_up() {
+      local pod="$1" role link sync
+      role="$(repl_field "${pod}" role)"
+      [[ "${role}" == "slave" ]] || return 1
+      link="$(repl_field "${pod}" master_link_status)"
+      sync="$(repl_field "${pod}" master_sync_in_progress)"
+      [[ "${link}" == "up" && "${sync}" == "0" ]]
+    }
+
+    point_replica_to() {
+      local pod="$1" src="$2"
+      redis_alive "${pod}" || return 1
+      if ! redis_cmd "${pod}" REPLICAOF "${src}.redis-headless" 6379 | grep -q OK; then
+        log "复制失败  ${pod} → ${src}.redis-headless"
+        return 1
+      fi
+      log "复制已指向  ${pod} → ${src}.redis-headless"
+      return 0
+    }
+
+    promote_to() {
+      local cand="$1" old="$2" p
+      log "故障切换  ${old:-?} → ${cand}"
+      redis_cmd "${cand}" REPLICAOF NO ONE >/dev/null || true
+      set_primary_pod "${cand}"
+      set_role "${cand}" primary
+      for p in $(list_redis); do
+        [[ -n "${p}" && "${p}" != "${cand}" ]] || continue
+        set_role "${p}" replica
+        if redis_alive "${p}"; then
+          point_replica_to "${p}" "${cand}" || log "warn ${p} 改指向失败"
+        fi
+      done
+      last_status=""
+      log "切换完成  主=${cand}（旧主恢复后仍做从库，不回切）"
+    }
+
+    pick_standby() {
+      local old p
+      old="$(current_pod)"
+      for p in $(list_redis); do
+        [[ -n "${p}" && "${p}" != "${old}" ]] || continue
+        redis_alive "${p}" && { echo "${p}"; return 0; }
+      done
+      return 1
+    }
+
+    replica_line() {
+      local pod="$1" role link sync src
+      if ! pod_ready "${pod}"; then echo "复制=无法查询"; return; fi
+      role="$(repl_field "${pod}" role)"
+      if [[ "${role}" != "slave" ]]; then
+        echo "复制=未配置"; return
+      fi
+      link="$(repl_field "${pod}" master_link_status)"
+      sync="$(repl_field "${pod}" master_sync_in_progress)"
+      src="$(repl_field "${pod}" master_host)"
+      if [[ "${link}" == "up" && "${sync}" == "0" ]]; then
+        echo "复制=正常 link=${link} sync=${sync} 源=${src}"
+      else
+        echo "复制=异常 link=${link:-none} sync=${sync:-?} 源=${src:-none}"
+      fi
+    }
+
+    print_roles() {
+      local cur p ready rpl line
+      cur="$(current_pod)"
+      line="主 ${cur}"
+      for p in $(list_redis); do
+        [[ -n "${p}" ]] || continue
+        if pod_ready "${p}"; then ready="Ready"; else ready="NotReady"; fi
+        if [[ "${p}" == "${cur}" ]]; then
+          line="${line} ${ready}"
+        else
+          rpl="$(replica_line "${p}")"
+          line="${line}  |  从 ${p} ${ready} ${rpl}"
+        fi
+      done
+      if [[ "${line}" != "${last_status}" ]]; then
+        log "${line}"
+        last_status="${line}"
+      fi
+    }
+
+    ensure_replicas() {
+      local cur p role
+      cur="$(current_pod)"
+      redis_alive "${cur}" || return 0
+      for p in $(list_redis); do
+        [[ -n "${p}" && "${p}" != "${cur}" ]] || continue
+        pod_ready "${p}" || continue
+        role="$(repl_field "${p}" role)"
+        if [[ "${role}" != "slave" ]] || ! replica_link_up "${p}"; then
+          log "ensure ${p} 复制未就绪 → 指向 ${cur}"
+          point_replica_to "${p}" "${cur}" || log "ensure ${p} 配置失败"
+        fi
+      done
+    }
+
+    log "启动  ns=${NS}  fail_after=${FAIL_AFTER}s  interval=${INTERVAL}s  策略=故障自动切换主库"
+    while true; do
+      sync_labels || true
+      print_roles || true
+      if redis_alive "$(current_pod)"; then
+        down_since=""
+        ensure_replicas || true
+      else
+        now="$(date +%s)"
+        if [[ -z "${down_since}" ]]; then
+          down_since="${now}"
+          last_status=""
+          log "主库不可用  $(current_pod)  开始计时"
+        elif (( now - down_since >= FAIL_AFTER )); then
+          cand="$(pick_standby || true)"
+          if [[ -n "${cand}" ]]; then
+            log "主库不可用≥${FAIL_AFTER}s，升主 ${cand}"
+            promote_to "${cand}" "$(current_pod)" || true
+          else
+            log "无可用从库可升主"
+          fi
+          down_since=""
+          last_status=""
+          print_roles || true
+        else
+          log "等待升主  $((now - down_since))/${FAIL_AFTER}s"
+        fi
+      fi
+      sleep "${INTERVAL}"
+    done
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-controller
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis-controller
+  template:
+    metadata:
+      labels:
+        app: redis-controller
+    spec:
+      serviceAccountName: redis-controller
+      containers:
+        - name: controller
+          image: registry.cn-global.starbucket.com.cn/starbucket/docker.io/alpine/k8s:1.33.1
+          imagePullPolicy: IfNotPresent
+          command: ["bash", "/scripts/run.sh"]
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: FAIL_AFTER
+              value: "1"
+            - name: INTERVAL
+              value: "1"
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-auth
+                  key: password
+                  optional: true
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: scripts
+          configMap:
+            name: redis-controller
+            defaultMode: 0755
