@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: nexus
+  name: nexus-service
   namespace: nexus
 spec:
   type: ClusterIP
@@ -32,42 +32,11 @@ spec:
       securityContext:
         fsGroup: 200
         fsGroupChangePolicy: OnRootMismatch
-      initContainers:
-        - name: wait-postgres
-          image: registry.cn-chengdu.aliyuncs.com/obsbot/postgres:16-alpine
-          imagePullPolicy: IfNotPresent
-          command:
-            - sh
-            - -c
-            - until pg_isready -h postgres -p 5432 -U nexus -d nexus; do sleep 2; done
       containers:
         - name: nexus
-          image: registry.cn-chengdu.aliyuncs.com/obsbot/nexus3:3.94.0
+          image: registry.cn-global.starbucket.com.cn/starbucket/docker.io/sonatype/nexus3:3.94.1
           imagePullPolicy: IfNotPresent
           env:
-            - name: POSTGRES_DB
-              valueFrom:
-                secretKeyRef:
-                  name: nexus-postgres
-                  key: POSTGRES_DB
-            - name: POSTGRES_USER
-              valueFrom:
-                secretKeyRef:
-                  name: nexus-postgres
-                  key: POSTGRES_USER
-            - name: POSTGRES_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: nexus-postgres
-                  key: POSTGRES_PASSWORD
-            - name: NEXUS_DATASTORE_NEXUS_JDBCURL
-              value: "jdbc:postgresql://postgres:5432/$(POSTGRES_DB)?currentSchema=nexus"
-            - name: NEXUS_DATASTORE_NEXUS_USERNAME
-              value: $(POSTGRES_USER)
-            - name: NEXUS_DATASTORE_NEXUS_PASSWORD
-              value: $(POSTGRES_PASSWORD)
-            - name: NEXUS_DATASTORE_NEXUS_ADVANCED
-              value: maximumPoolSize=100
             - name: INSTALL4J_ADD_VM_PARAMS
               value: >-
                 -Xms3g -Xmx6g -XX:MaxDirectMemorySize=3g
