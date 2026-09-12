@@ -1,3 +1,7 @@
+# 外接 Postgres：先在目标库执行
+#   CREATE SCHEMA IF NOT EXISTS nexus;
+#   GRANT ALL ON SCHEMA nexus TO nexus;
+#   ALTER ROLE nexus SET search_path TO nexus, public;
 ---
 apiVersion: v1
 kind: Secret
@@ -6,23 +10,11 @@ metadata:
   namespace: nexus
 type: Opaque
 stringData:
+  POSTGRES_HOST: postgres.default.svc.cluster.local
+  POSTGRES_PORT: "5432"
   POSTGRES_DB: nexus
   POSTGRES_USER: nexus
   POSTGRES_PASSWORD: KK8[)x5m#Q:Ho3Ux5V%^0aFP
-
----
-# 仅在 Postgres 数据目录为空时执行一次（对应 compose 的 docker-entrypoint-initdb.d）
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: postgres-init
-  namespace: nexus
-data:
-  01-init-nexus.sql: |
-    CREATE SCHEMA IF NOT EXISTS nexus;
-    GRANT ALL ON SCHEMA nexus TO nexus;
-    ALTER ROLE nexus SET search_path TO nexus, public;
-
 ---
 apiVersion: v1
 kind: Service
@@ -57,11 +49,73 @@ spec:
       securityContext:
         fsGroup: 200
         fsGroupChangePolicy: OnRootMismatch
+      initContainers:
+        - name: wait-postgres
+          image: registry.cn-global.starbucket.com.cn/starbucket/docker.io/library/postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: PGHOST
+              valueFrom:
+                secretKeyRef:
+                  name: nexus-postgres
+                  key: POSTGRES_HOST
+            - name: PGPORT
+              valueFrom:
+                secretKeyRef:
+                  name: nexus-postgres
+                  key: POSTGRES_PORT
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: nexus-postgres
+                  key: POSTGRES_USER
+            - name: PGDATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: nexus-postgres
+                  key: POSTGRES_DB
+          command:
+            - sh
+            - -c
+            - until pg_isready; do sleep 2; done
       containers:
         - name: nexus
           image: registry.cn-global.starbucket.com.cn/starbucket/docker.io/sonatype/nexus3:3.94.1
           imagePullPolicy: IfNotPresent
           env:
+            - name: POSTGRES_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: nexus-postgres
+                  key: POSTGRES_HOST
+            - name: POSTGRES_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: nexus-postgres
+                  key: POSTGRES_PORT
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: nexus-postgres
+                  key: POSTGRES_DB
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: nexus-postgres
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nexus-postgres
+                  key: POSTGRES_PASSWORD
+            - name: NEXUS_DATASTORE_NEXUS_JDBCURL
+              value: "jdbc:postgresql://$(POSTGRES_HOST):$(POSTGRES_PORT)/$(POSTGRES_DB)?currentSchema=nexus"
+            - name: NEXUS_DATASTORE_NEXUS_USERNAME
+              value: $(POSTGRES_USER)
+            - name: NEXUS_DATASTORE_NEXUS_PASSWORD
+              value: $(POSTGRES_PASSWORD)
+            - name: NEXUS_DATASTORE_NEXUS_ADVANCED
+              value: maximumPoolSize=100
             - name: INSTALL4J_ADD_VM_PARAMS
               value: >-
                 -Xms3g -Xmx6g -XX:MaxDirectMemorySize=3g
