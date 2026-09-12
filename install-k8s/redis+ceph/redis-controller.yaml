@@ -1,5 +1,6 @@
 # 故障转移：当前主不可用 → 升从库；谁升主就一直当主，不回切
 # Service/redis / TCPRoute 跟随 redis.role=primary
+# 检测：Pod Watch + TCP 长连接；切主后 topology/从库指向异步对齐
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -41,11 +42,30 @@ data:
     #!/bin/bash
     set -uo pipefail
     NS="${NAMESPACE:-default}"
-    FAIL_AFTER="${FAIL_AFTER:-1}"
-    INTERVAL="${INTERVAL:-1}"
+    FAIL_AFTER="${FAIL_AFTER:-0}"
+    INTERVAL="${INTERVAL:-0.15}"
     PW="${REDIS_PASSWORD:-}"
+    STATE="/tmp/redis-ctl"
+    CACHE="${STATE}/pods.cache"
+    FIFO="${STATE}/event"
+    PRIMARY_FILE="${STATE}/primary"
+
+    mkdir -p "${STATE}"
+    : > "${CACHE}"
+    rm -f "${FIFO}"
+    mkfifo "${FIFO}"
+    exec 6<>"${FIFO}"
 
     log() { echo "[$(date -u +%H:%M:%S)] $*"; }
+
+    now_ms() {
+      local t
+      t="$(date +%s%3N 2>/dev/null || true)"
+      if [[ "${t}" =~ ^[0-9]{13}$ ]]; then echo "${t}"; return; fi
+      t="$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || true)"
+      if [[ "${t}" =~ ^[0-9]+$ ]]; then echo "${t}"; return; fi
+      echo "$(($(date +%s) * 1000))"
+    }
 
     secret_b64() {
       local sec="$1" key="$2"
@@ -67,15 +87,45 @@ data:
       sleep 30
       exit 1
     fi
-    down_since=""
-    last_status=""
+    export REDIS_TCP_PW="${PW}"
 
-    pod_ready() {
-      local p="$1"
-      [[ "$(kubectl -n "${NS}" get pod "${p}" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" == "True" ]]
+    down_since_ms=""
+    last_status=""
+    PRIMARY=""
+    promoting=0
+    bg_pid=""
+    PAUSE_ENSURE="${STATE}/pause_ensure"
+
+    notify() { echo x >&6 2>/dev/null || true; }
+
+    pause_ensure() {
+      : > "${PAUSE_ENSURE}"
+      if [[ -n "${bg_pid:-}" ]] && kill -0 "${bg_pid}" 2>/dev/null; then
+        kill "${bg_pid}" 2>/dev/null || true
+        wait "${bg_pid}" 2>/dev/null || true
+      fi
+      bg_pid=""
     }
 
+    resume_ensure() { rm -f "${PAUSE_ENSURE}"; }
+
+    dump_pods() {
+      local tmp="${CACHE}.tmp.$$.$RANDOM"
+      if ! kubectl -n "${NS}" get pods -l app=redis -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.podIP}{"\t"}{.status.phase}{"\t"}{.metadata.deletionTimestamp}{"\t"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' \
+        > "${tmp}" 2>/dev/null; then
+        rm -f "${tmp}"
+        return 1
+      fi
+      mv -f "${tmp}" "${CACHE}"
+    }
+
+    pod_row() { awk -F'\t' -v p="$1" '$1==p {print; exit}' "${CACHE}" 2>/dev/null; }
+    pod_ip() { pod_row "$1" | cut -f2; }
+
     list_redis() {
+      local names
+      names="$(awk -F'\t' 'NF && $1!=""{print $1}' "${CACHE}" 2>/dev/null | sort)"
+      if [[ -n "${names}" ]]; then echo "${names}"; return; fi
       kubectl -n "${NS}" get pods -l app=redis \
         -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | sort || true
     }
@@ -84,12 +134,13 @@ data:
       kubectl -n "${NS}" get cm redis-topology -o jsonpath="{.data.$1}" 2>/dev/null | tr -d '[:space:]'
     }
 
-    current_pod() {
-      local p first
+    current_pod() { echo "${PRIMARY}"; }
+
+    load_primary() {
+      local p
       p="$(cm_get primary-pod)"
-      if [[ -n "${p}" ]]; then echo "${p}"; return; fi
-      first="$(list_redis | head -1)"
-      echo "${first:-redis-0}"
+      PRIMARY="${p:-redis-0}"
+      echo "${PRIMARY}" > "${PRIMARY_FILE}"
     }
 
     set_primary_pod() {
@@ -97,15 +148,25 @@ data:
         -p "{\"data\":{\"primary-pod\":\"$1\"}}" >/dev/null
     }
 
-    redis_ping() {
-      kubectl -n "${NS}" exec "$1" -c redis -- \
-        redis-cli -a "${PW}" --no-auth-warning ping 2>/dev/null | grep -q PONG
+    redis_tcp_cmd() {
+      local ip="$1" cmd="$2"
+      [[ -n "${ip}" ]] || return 1
+      timeout 1 bash -c '
+        ip="$0"; cmd="$1"
+        exec 3<>/dev/tcp/"$ip"/6379 || exit 1
+        printf "AUTH %s\r\n%s\r\n" "${REDIS_TCP_PW}" "${cmd}" >&3
+        out=""
+        for _ in 1 2 3 4; do
+          IFS= read -r -t 0.4 -u 3 line || break
+          printf -v out "%s%s\n" "${out}" "${line}"
+        done
+        printf "%s" "${out}"
+      ' "${ip}" "${cmd}" 2>/dev/null
     }
 
-    redis_info() {
-      kubectl -n "${NS}" exec "$1" -c redis -- \
-        redis-cli -a "${PW}" --no-auth-warning INFO replication 2>/dev/null \
-        | tr -d '\r' | grep -v 'Warning:' || true
+    redis_tcp_ping() {
+      local ip="$1"
+      redis_tcp_cmd "${ip}" PING | grep -q PONG
     }
 
     redis_cmd() {
@@ -115,11 +176,27 @@ data:
         | tr -d '\r' | grep -v 'Warning:' || true
     }
 
-    redis_alive() { pod_ready "$1" && redis_ping "$1"; }
+    redis_info() {
+      redis_cmd "$1" INFO replication
+    }
 
-    repl_field() {
-      local pod="$1" key="$2"
-      redis_info "${pod}" | awk -F: -v k="${key}" '$1==k {print $2; exit}' | tr -d '[:space:]'
+    pod_running() {
+      local row phase del ip
+      row="$(pod_row "$1")"
+      [[ -n "${row}" ]] || return 1
+      ip="$(echo "${row}" | cut -f2)"
+      phase="$(echo "${row}" | cut -f3)"
+      del="$(echo "${row}" | cut -f4)"
+      [[ "${phase}" == "Running" ]] || return 1
+      [[ -z "${del}" ]] || return 1
+      [[ -n "${ip}" ]] || return 1
+    }
+
+    primary_healthy() {
+      local p="$1" ip
+      pod_running "${p}" || return 1
+      ip="$(pod_ip "${p}")"
+      redis_tcp_ping "${ip}"
     }
 
     set_role() {
@@ -127,17 +204,6 @@ data:
       cur="$(kubectl -n "${NS}" get pod "${p}" -o jsonpath='{.metadata.labels.redis\.role}' 2>/dev/null || true)"
       [[ "${cur}" == "${want}" ]] && return 0
       kubectl -n "${NS}" label pod "${p}" "redis.role=${want}" --overwrite >/dev/null 2>&1 || true
-    }
-
-    sync_labels() {
-      local want p
-      want="$(current_pod)"
-      for p in $(list_redis); do
-        [[ -n "${p}" ]] || continue
-        if [[ "${p}" == "${want}" ]]; then set_role "${p}" primary
-        else set_role "${p}" replica
-        fi
-      done
     }
 
     replica_link_up() {
@@ -149,47 +215,97 @@ data:
       [[ "${link}" == "up" && "${sync}" == "0" ]]
     }
 
-    point_replica_to() {
-      local pod="$1" src="$2"
-      redis_alive "${pod}" || return 1
-      if ! redis_cmd "${pod}" REPLICAOF "${src}.redis-headless" 6379 | grep -q OK; then
-        log "复制失败  ${pod} → ${src}.redis-headless"
-        return 1
-      fi
-      log "复制已指向  ${pod} → ${src}.redis-headless"
-      return 0
+    repl_field() {
+      local pod="$1" key="$2"
+      redis_info "${pod}" | awk -F: -v k="${key}" '$1==k {print $2; exit}' | tr -d '[:space:]'
     }
 
-    promote_to() {
-      local cand="$1" old="$2" p
-      log "故障切换  ${old:-?} → ${cand}"
-      redis_cmd "${cand}" REPLICAOF NO ONE >/dev/null || true
-      set_primary_pod "${cand}"
-      set_role "${cand}" primary
+    point_replica_to() {
+      local pod="$1" src="$2" ip out
+      ip="$(pod_ip "${pod}")"
+      if [[ -n "${ip}" ]]; then
+        out="$(redis_tcp_cmd "${ip}" "REPLICAOF ${src}.redis-headless 6379" || true)"
+        if echo "${out}" | grep -q OK; then
+          log "复制已指向  ${pod} → ${src}.redis-headless"
+          return 0
+        fi
+      fi
+      if redis_cmd "${pod}" REPLICAOF "${src}.redis-headless" 6379 | grep -q OK; then
+        log "复制已指向  ${pod} → ${src}.redis-headless"
+        return 0
+      fi
+      log "复制失败  ${pod} → ${src}.redis-headless"
+      return 1
+    }
+
+    promote_redis() {
+      local cand="$1" ip out
+      ip="$(pod_ip "${cand}")"
+      if [[ -n "${ip}" ]]; then
+        out="$(redis_tcp_cmd "${ip}" "REPLICAOF NO ONE" || true)"
+        if echo "${out}" | grep -qi OK; then
+          return 0
+        fi
+      fi
+      redis_cmd "${cand}" REPLICAOF NO ONE | grep -qi OK
+    }
+
+    async_align() {
+      local cand="$1" p
+      set_primary_pod "${cand}" || log "warn 更新 redis-topology 失败"
+      dump_pods || true
       for p in $(list_redis); do
         [[ -n "${p}" && "${p}" != "${cand}" ]] || continue
         set_role "${p}" replica
-        if redis_alive "${p}"; then
+        if pod_running "${p}" && redis_tcp_ping "$(pod_ip "${p}")"; then
           point_replica_to "${p}" "${cand}" || log "warn ${p} 改指向失败"
         fi
       done
+      log "异步配置已更新  topology=${cand}  从库指向已对齐"
+    }
+
+    promote_to() {
+      local cand="$1" old="$2" t1 ms
+      [[ "${promoting}" == "0" ]] || return 0
+      promoting=1
+      pause_ensure
+      log "故障切换  ${old:-?} → ${cand}"
+      if ! promote_redis "${cand}"; then
+        log "warn 升主命令未确认 OK，仍切换 Service 标签"
+      fi
+      set_role "${cand}" primary
+      PRIMARY="${cand}"
+      echo "${cand}" > "${PRIMARY_FILE}"
+      t1="$(now_ms)"
+      ms=$((t1 - down_since_ms))
+      (( ms < 0 )) && ms=0
+      log "切主成功  主=${cand}  故障开始→切主成功 ${ms}ms"
+      down_since_ms=""
       last_status=""
-      log "切换完成  主=${cand}（旧主恢复后仍做从库，不回切）"
+      (
+        async_align "${cand}" || true
+        resume_ensure
+      ) &
+      promoting=0
     }
 
     pick_standby() {
       local old p
       old="$(current_pod)"
+      dump_pods || true
       for p in $(list_redis); do
         [[ -n "${p}" && "${p}" != "${old}" ]] || continue
-        redis_alive "${p}" && { echo "${p}"; return 0; }
+        if pod_running "${p}" && redis_tcp_ping "$(pod_ip "${p}")"; then
+          echo "${p}"
+          return 0
+        fi
       done
       return 1
     }
 
     replica_line() {
       local pod="$1" role link sync src
-      if ! pod_ready "${pod}"; then echo "复制=无法查询"; return; fi
+      if ! pod_running "${pod}"; then echo "复制=无法查询"; return; fi
       role="$(repl_field "${pod}" role)"
       if [[ "${role}" != "slave" ]]; then
         echo "复制=未配置"; return
@@ -210,7 +326,7 @@ data:
       line="主 ${cur}"
       for p in $(list_redis); do
         [[ -n "${p}" ]] || continue
-        if pod_ready "${p}"; then ready="Ready"; else ready="NotReady"; fi
+        if pod_running "${p}"; then ready="Ready"; else ready="NotReady"; fi
         if [[ "${p}" == "${cur}" ]]; then
           line="${line} ${ready}"
         else
@@ -225,49 +341,127 @@ data:
     }
 
     ensure_replicas() {
-      local cur p role
+      local cur p role want
+      [[ -f "${PAUSE_ENSURE}" ]] && return 0
       cur="$(current_pod)"
-      redis_alive "${cur}" || return 0
+      want="$(cat "${PRIMARY_FILE}" 2>/dev/null || echo "${cur}")"
+      [[ "${cur}" == "${want}" ]] || return 0
+      primary_healthy "${cur}" || return 0
       for p in $(list_redis); do
         [[ -n "${p}" && "${p}" != "${cur}" ]] || continue
-        pod_ready "${p}" || continue
+        [[ -f "${PAUSE_ENSURE}" ]] && return 0
+        pod_running "${p}" || continue
         role="$(repl_field "${p}" role)"
         if [[ "${role}" != "slave" ]] || ! replica_link_up "${p}"; then
+          # 切主/故障中禁止把从库指回旧主
+          [[ -f "${PAUSE_ENSURE}" ]] && return 0
+          [[ "$(cat "${PRIMARY_FILE}" 2>/dev/null)" == "${cur}" ]] || return 0
+          primary_healthy "${cur}" || return 0
           log "ensure ${p} 复制未就绪 → 指向 ${cur}"
           point_replica_to "${p}" "${cur}" || log "ensure ${p} 配置失败"
         fi
       done
     }
 
-    log "启动  ns=${NS}  fail_after=${FAIL_AFTER}s  interval=${INTERVAL}s  策略=故障自动切换主库"
-    while true; do
-      sync_labels || true
-      print_roles || true
-      if redis_alive "$(current_pod)"; then
-        down_since=""
-        ensure_replicas || true
-      else
-        now="$(date +%s)"
-        if [[ -z "${down_since}" ]]; then
-          down_since="${now}"
-          last_status=""
-          log "主库不可用  $(current_pod)  开始计时"
-        elif (( now - down_since >= FAIL_AFTER )); then
-          cand="$(pick_standby || true)"
-          if [[ -n "${cand}" ]]; then
-            log "主库不可用≥${FAIL_AFTER}s，升主 ${cand}"
-            promote_to "${cand}" "$(current_pod)" || true
-          else
-            log "无可用从库可升主"
-          fi
-          down_since=""
-          last_status=""
-          print_roles || true
-        else
-          log "等待升主  $((now - down_since))/${FAIL_AFTER}s"
-        fi
+    maybe_bg() {
+      [[ -f "${PAUSE_ENSURE}" ]] && return 0
+      if [[ -n "${bg_pid}" ]] && kill -0 "${bg_pid}" 2>/dev/null; then
+        return 0
       fi
-      sleep "${INTERVAL}"
+      (
+        [[ -f "${PAUSE_ENSURE}" ]] && exit 0
+        print_roles || true
+        ensure_replicas || true
+      ) &
+      bg_pid=$!
+    }
+
+    watch_pods() {
+      while true; do
+        dump_pods || true
+        notify
+        kubectl -n "${NS}" get pods -l app=redis --watch -o name 2>/dev/null |
+        while IFS= read -r _; do
+          dump_pods || true
+          notify
+        done
+        sleep 0.2
+      done
+    }
+
+    tcp_hold() {
+      local cur ip
+      while true; do
+        cur="$(cat "${PRIMARY_FILE}" 2>/dev/null || true)"
+        ip="$(pod_ip "${cur}")"
+        if [[ -z "${cur}" || -z "${ip}" ]]; then
+          sleep 0.1
+          continue
+        fi
+        if ! timeout 86400 bash -c '
+          ip="$0"
+          exec 3<>/dev/tcp/"$ip"/6379 || exit 1
+          printf "AUTH %s\r\nPING\r\n" "${REDIS_TCP_PW}" >&3
+          IFS= read -r -t 2 -u 3 _ || exit 1
+          IFS= read -r -t 2 -u 3 line || exit 1
+          echo "${line}" | grep -q PONG || exit 1
+          while true; do
+            printf "PING\r\n" >&3 || exit 1
+            IFS= read -r -t 2 -u 3 line || exit 1
+            echo "${line}" | grep -q PONG || exit 1
+            sleep 0.15
+          done
+        ' "${ip}" 2>/dev/null; then
+          log "TCP 连接断开  ${cur} ${ip}"
+          dump_pods || true
+          notify
+        fi
+        sleep 0.05
+      done
+    }
+
+    check_failover() {
+      local cur now cand fail_ms
+      cur="$(current_pod)"
+      if primary_healthy "${cur}"; then
+        down_since_ms=""
+        resume_ensure
+        maybe_bg
+        return 0
+      fi
+      now="$(now_ms)"
+      if [[ -z "${down_since_ms}" ]]; then
+        down_since_ms="${now}"
+        last_status=""
+        pause_ensure
+        log "主库不可用  ${cur}  故障开始"
+      fi
+      fail_ms=$((FAIL_AFTER * 1000))
+      if (( now - down_since_ms < fail_ms )); then
+        log "等待升主  $((now - down_since_ms))/${fail_ms}ms"
+        return 0
+      fi
+      cand="$(pick_standby || true)"
+      if [[ -n "${cand}" ]]; then
+        log "主库不可用，升主 ${cand}"
+        promote_to "${cand}" "${cur}" || true
+      else
+        log "无可用从库可升主"
+      fi
+    }
+
+    trap 'kill $(jobs -p) 2>/dev/null || true' EXIT
+
+    load_primary
+    resume_ensure
+    dump_pods || true
+    watch_pods &
+    tcp_hold &
+
+    log "启动  ns=${NS}  fail_after=${FAIL_AFTER}s  interval=${INTERVAL}s  主=${PRIMARY}  策略=Watch+TCP即时升主，配置异步对齐"
+    while true; do
+      check_failover || true
+      read -t "${INTERVAL}" -r -u 6 _ || true
     done
 ---
 apiVersion: apps/v1
@@ -297,9 +491,9 @@ spec:
                 fieldRef:
                   fieldPath: metadata.namespace
             - name: FAIL_AFTER
-              value: "1"
+              value: "0"
             - name: INTERVAL
-              value: "1"
+              value: "0.15"
             - name: REDIS_PASSWORD
               valueFrom:
                 secretKeyRef:

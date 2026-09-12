@@ -4,7 +4,7 @@
 - **一 Pod 一盘**（`ceph-rbd`，AOF 持久化）
 - ConfigMap `redis-topology`：`primary-pod` 记录当前主
 - 客户端连 **Service `redis`**（`redis.role=primary`）← 可选 TCPRoute
-- **`redis-controller`**：当前主挂掉 ≥1s → 升从；**不回切**
+- **`redis-controller`**：TCP 长连接 + Pod Watch 即时检测 → **毫秒级升从**（总切换通常 <1s）；先升主并切 Service 标签，topology / 从库指向异步对齐；**不回切**
 
 ### 1. 部署
 
@@ -23,7 +23,13 @@ kubectl logs -f deploy/redis-controller
 
 ```text
 [08:24:08] 主 redis-0 Ready  |  从 redis-1 Ready 复制=正常 link=up sync=0 源=redis-0.redis-headless
+[08:24:12] 主库不可用  redis-0  故障开始
+[08:24:12] 故障切换  redis-0 → redis-1
+[08:24:12] 切主成功  主=redis-1  故障开始→切主成功 87ms
+[08:24:12] 异步配置已更新  topology=redis-1  从库指向已对齐
 ```
+
+耗时只统计 **故障开始 → 主库切换成功**（`REPLICAOF NO ONE` + `redis.role=primary`）。不统计故障 Pod 恢复、topology / 从库指向的异步对齐时间。
 
 ### 2. 连接
 
@@ -41,7 +47,7 @@ kubectl run redis-cli --rm -it --restart=Never \
 ```bash
 kubectl logs -f deploy/redis-controller
 kubectl delete pod redis-0 --grace-period=0 --force
-# 约 1–3s：升主 redis-1，ep/redis 指向 redis-1
+# 通常 <1s：升主 redis-1，ep/redis 指向 redis-1（日志会打印关键路径耗时 ms）
 
 kubectl get cm redis-topology -o jsonpath='{.data.primary-pod}{"\n"}'
 kubectl get ep redis
