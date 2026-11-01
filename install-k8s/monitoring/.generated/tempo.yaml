@@ -1,0 +1,51 @@
+replicas: 0
+tempo:
+  registry: registry.cn-global.starbucket.com.cn/starbucket
+  repository: docker.io/grafana/tempo
+  tag: 2.9.0
+  pullPolicy: IfNotPresent
+  reportingEnabled: false
+  retention: 720h
+  livenessProbe:
+    httpGet: null
+    tcpSocket:
+      port: 3200
+    initialDelaySeconds: 60
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 6
+    successThreshold: 1
+  readinessProbe:
+    httpGet:
+      path: /ready
+      port: 3200
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 12
+    successThreshold: 1
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      cpu: '1'
+      memory: 2Gi
+tempoQuery:
+  enabled: false
+persistence:
+  enabled: true
+  enableStatefulSetAutoDeletePVC: false
+  accessModes:
+  - ReadWriteOnce
+  size: 50Gi
+  storageClassName: ceph-rbd
+serviceMonitor:
+  enabled: false

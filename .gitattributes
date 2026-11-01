@@ -1,0 +1,13 @@
+# 本仓库脚本部署到 Linux 执行，统一使用 LF 换行，
+# 防止 Windows 端 core.autocrlf=true 在 checkout 时把脚本变成 CRLF
+* text=auto eol=lf
+
+# 二进制文件显式声明，避免被误判为文本而损坏
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.gz binary
+*.tar binary
+*.zip binary

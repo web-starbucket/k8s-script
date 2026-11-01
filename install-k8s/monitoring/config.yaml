@@ -1,8 +1,19 @@
 # =============================================================================
-# 监控一体配置（Prometheus + Grafana + Alertmanager + Loki + Promtail + Tempo）
+# 监控一体配置（Prometheus + Grafana + Alertmanager + Loki + Alloy + Tempo）
 # 使用：bash install.sh
 # =============================================================================
 
+# ----- 存储后端 -----
+# type: nfs       静态 PV，需先在 NFS 服务器建目录并授权（见 README 3.2）
+#       ceph-rbd  动态供给（推荐）；需先装 install-ceph 的 CSI，StorageClass 默认 ceph-rbd
+#                 注意：ceph-rbd 的 reclaimPolicy=Delete，destroy/reinstall 会连数据一起删
+# size: 可选；设置后统一覆盖 5 个组件的 PVC 容量（RBD 精简供给，不占满不算空间）
+storage:
+  type: ceph-rbd
+  storageClass: ceph-rbd
+  size: 50Gi
+
+# type=nfs 时生效
 nfs:
   server: 172.16.10.129
   basePath: /data/nfs/shared/monitoring
@@ -74,6 +85,9 @@ kubePrometheus:
       enabled: true
       type: pvc
       existingClaim: data-grafana
+    # RWO 卷（ceph-rbd）与滚动更新冲突（Multi-Attach），必须 Recreate：先杀旧 Pod 再起新的
+    deploymentStrategy:
+      type: Recreate
   alertmanager:
     enabled: true
     service:
@@ -81,6 +95,9 @@ kubePrometheus:
       nodePort: 30303
     alertmanagerSpec:
       replicas: 1
+      # 放开全 namespace：业务分区可在自己 ns 建 AlertmanagerConfig 自定义告警路由
+      alertmanagerConfigSelector: {}
+      alertmanagerConfigNamespaceSelector: {}
       image:
         registry: registry.cn-global.starbucket.com.cn/starbucket
         repository: quay.io/prometheus/alertmanager
@@ -104,6 +121,19 @@ kubePrometheus:
       retention: 15d
       scrapeInterval: 30s
       evaluationInterval: 30s
+      # —— 监控所有 namespace（新业务分区 dev/test/prod 无需改这里）——
+      # chart 默认只采集带本 release 标签的 CR；关掉 helm 标签限制 + 空选择器
+      # = 任意 namespace 的 ServiceMonitor/PodMonitor/ScrapeConfig/PrometheusRule 自动生效
+      serviceMonitorSelectorNilUsesHelmValues: false
+      podMonitorSelectorNilUsesHelmValues: false
+      probeSelectorNilUsesHelmValues: false
+      scrapeConfigSelectorNilUsesHelmValues: false
+      ruleSelectorNilUsesHelmValues: false
+      serviceMonitorNamespaceSelector: {}    # {} = 所有 namespace
+      podMonitorNamespaceSelector: {}
+      probeNamespaceSelector: {}
+      scrapeConfigNamespaceSelector: {}
+      ruleNamespaceSelector: {}
       image:
         registry: registry.cn-global.starbucket.com.cn/starbucket
         repository: quay.io/prometheus/prometheus
@@ -199,9 +229,9 @@ loki:
             period: 24h
     storage:
       type: filesystem
-    # 日志保留约 2 个月，到期由 Compactor 自动删除
+    # 日志保留 3 个月，到期由 Compactor 自动删除
     limits_config:
-      retention_period: 1440h   # 60d
+      retention_period: 2160h   # 90d = 3 个月
     compactor:
       working_directory: /var/loki/compactor
       compaction_interval: 10m
@@ -284,14 +314,16 @@ tempo:
   tempo:
     registry: registry.cn-global.starbucket.com.cn/starbucket
     repository: docker.io/grafana/tempo
-    tag: "2.7.2"
+    tag: "2.9.0"
     pullPolicy: IfNotPresent
     reportingEnabled: false
-    retention: 168h   # 7d
-    # /ready 未就绪会 503；liveness 用 /metrics，避免探针把 Pod 杀掉
+    retention: 720h   # 30d
+    # liveness 用 TCP 探端口（HTTP /metrics 会让 kubelet 每次探活在 Tempo 日志里刷 broken pipe 噪音）；
+    # /ready 未就绪会 503，不要拿它做 liveness，避免探针把 Pod 杀掉。
+    # 注意：chart 默认带 httpGet，helm values 深合并，必须显式 httpGet: null 抹掉，否则两个 handler 并存报错
     livenessProbe:
-      httpGet:
-        path: /metrics
+      httpGet: null
+      tcpSocket:
         port: 3200
       initialDelaySeconds: 60
       periodSeconds: 15
@@ -333,28 +365,92 @@ tempo:
   serviceMonitor:
     enabled: false
 
-# ----- Promtail -----
-promtail:
+# ----- Alloy（日志采集，替代 Promtail——Promtail 2026-03 EOL；helm grafana/alloy）-----
+# 镜像走 starbucket（alloy v1.21.3 已同步）；如 starbucket 缺新版本会 ImagePullBackOff，
+# 兜底可临时改 docker.m.daocloud.io + repository 去掉 docker.io/ 前缀
+alloy:
   image:
     registry: registry.cn-global.starbucket.com.cn/starbucket
-    repository: docker.io/grafana/promtail
-    tag: "3.3.2"
-  config:
-    clients:
-      - url: http://loki-gateway.monitoring.svc.cluster.local/loki/api/v1/push
-        tenant_id: fake
-    snippets:
-      pipelineStages:
-        - cri: {}
+    repository: docker.io/grafana/alloy
+    tag: "v1.21.3"        # starbucket 现有版本；升级前先探测 starbucket 有没有新 tag
+    pullPolicy: IfNotPresent
+  configReloader:
+    image:
+      # 新版 alloy chart 的 reloader 是 prometheus-config-reloader（--watched-dir 参数风格），
+      # 不能用 jimmidyson/configmap-reload（--volume-dir 风格），参数不兼容会 CrashLoop
+      registry: registry.cn-global.starbucket.com.cn/starbucket
+      repository: quay.io/prometheus-operator/prometheus-config-reloader
+      tag: "v0.77.2"      # starbucket 有此版；chart 默认 v0.94.2 未同步，推上去后可换
+      digest: ""
+      pullPolicy: IfNotPresent
+  controller:
+    type: daemonset
+    tolerations:
+      - effect: NoSchedule
+        operator: Exists
+      - effect: NoExecute
+        operator: Exists
   resources:
     requests:
       cpu: 50m
       memory: 64Mi
     limits:
-      cpu: 200m
-      memory: 256Mi
-  tolerations:
-    - effect: NoSchedule
-      operator: Exists
-    - effect: NoExecute
-      operator: Exists
+      cpu: 512m
+      memory: 512Mi
+  alloy:
+    mounts:
+      varlog: true          # 挂 /var/log，loki.source.file 读容器日志文件
+    configMap:
+      content: |
+        // 采集 /var/log/pods 下容器日志 → cri 解析 → loki-gateway（等价原 Promtail）
+        discovery.kubernetes "pods" {
+          role = "pod"
+        }
+
+        discovery.relabel "pods" {
+          targets = discovery.kubernetes.pods.targets
+
+          rule {
+            source_labels = ["__meta_kubernetes_namespace"]
+            target_label  = "namespace"
+          }
+          rule {
+            source_labels = ["__meta_kubernetes_pod_name"]
+            target_label  = "pod"
+          }
+          rule {
+            source_labels = ["__meta_kubernetes_pod_container_name"]
+            target_label  = "container"
+          }
+          rule {
+            source_labels = ["__meta_kubernetes_pod_label_app_kubernetes_io_name"]
+            target_label  = "app"
+          }
+          rule {
+            source_labels = ["__meta_kubernetes_pod_uid", "__meta_kubernetes_pod_container_name"]
+            separator     = "/"
+            replacement   = "/var/log/pods/*$1/*.log"
+            target_label  = "__path__"
+          }
+        }
+
+        local.file_match "pods" {
+          path_targets = discovery.relabel.pods.output
+        }
+
+        loki.source.file "pods" {
+          targets    = local.file_match.pods.targets
+          forward_to = [loki.process.cri.receiver]
+        }
+
+        loki.process "cri" {
+          stage.cri {}
+          forward_to = [loki.write.loki.receiver]
+        }
+
+        loki.write "loki" {
+          endpoint {
+            url       = "http://loki-gateway.monitoring.svc.cluster.local/loki/api/v1/push"
+            tenant_id = "fake"
+          }
+        }

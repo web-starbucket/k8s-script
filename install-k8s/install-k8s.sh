@@ -1428,7 +1428,8 @@ cmd_join_workers() {
     fi
 
     if is_local_ip "${ip}"; then
-      if [[ "${do_reset}" == "1" ]] || [[ -f /etc/kubernetes/kubelet.conf ]]; then
+      if [[ "${do_reset}" == "1" ]] \
+        || [[ -e /etc/kubernetes/kubelet.conf || -e /etc/kubernetes/bootstrap-kubelet.conf || -e /etc/kubernetes/pki/ca.crt ]]; then
         log "清理本机旧集群残留后 join"
         bash "${SCRIPT_DIR}/install-k8s.sh" reset --yes || true
       fi
@@ -1459,8 +1460,8 @@ cmd_join_workers() {
     }
 
     if [[ "${do_reset}" == "1" ]] \
-      || remote_ssh "${user}" "${ip}" "${pass}" "test -f /etc/kubernetes/kubelet.conf" 2>/dev/null; then
-      log "远程 reset（清理 kubelet.conf / 10250 残留）..."
+      || remote_ssh "${user}" "${ip}" "${pass}" "test -e /etc/kubernetes/kubelet.conf -o -e /etc/kubernetes/bootstrap-kubelet.conf -o -e /etc/kubernetes/pki/ca.crt" 2>/dev/null; then
+      log "远程 reset（清理 kubelet.conf / bootstrap-kubelet.conf / pki 等残留）..."
       remote_ssh "${user}" "${ip}" "${pass}" "cd ${remote_dir} && bash install-k8s.sh reset --yes" \
         || warn "reset 失败，仍尝试 join"
     fi

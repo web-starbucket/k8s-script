@@ -1,0 +1,184 @@
+fullnameOverride: monitoring
+defaultRules:
+  create: true
+grafana:
+  enabled: true
+  adminUser: admin
+  adminPassword: admin123456
+  image:
+    registry: registry.cn-global.starbucket.com.cn/starbucket
+    repository: docker.io/grafana/grafana
+    tag: 11.5.2
+    pullPolicy: IfNotPresent
+  grafana.ini:
+    users:
+      default_language: zh-Hans
+  sidecar:
+    image:
+      registry: registry.cn-global.starbucket.com.cn/starbucket
+      repository: quay.io/kiwigrid/k8s-sidecar
+      tag: 1.28.0
+    datasources:
+      enabled: true
+  additionalDataSources:
+  - name: Loki
+    type: loki
+    uid: loki
+    access: proxy
+    url: http://loki-gateway.monitoring.svc.cluster.local
+    isDefault: false
+    jsonData:
+      maxLines: 1000
+      timeout: 60
+  - name: Tempo
+    type: tempo
+    uid: tempo
+    access: proxy
+    url: http://tempo.monitoring.svc.cluster.local:3200
+    isDefault: false
+    jsonData:
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: -1m
+        spanEndTimeShift: 1m
+        filterByTraceID: true
+      tracesToMetrics:
+        datasourceUid: prometheus
+      serviceMap:
+        datasourceUid: prometheus
+      nodeGraph:
+        enabled: true
+      lokiSearch:
+        datasourceUid: loki
+  initChownData:
+    enabled: false
+    image:
+      registry: registry.cn-global.starbucket.com.cn/starbucket
+      repository: docker.io/library/busybox
+      tag: 1.36.1
+  service:
+    type: NodePort
+    nodePort: 30300
+  persistence:
+    enabled: true
+    type: pvc
+    existingClaim: data-grafana
+  deploymentStrategy:
+    type: Recreate
+alertmanager:
+  enabled: true
+  service:
+    type: NodePort
+    nodePort: 30303
+  alertmanagerSpec:
+    replicas: 1
+    alertmanagerConfigSelector: {}
+    alertmanagerConfigNamespaceSelector: {}
+    image:
+      registry: registry.cn-global.starbucket.com.cn/starbucket
+      repository: quay.io/prometheus/alertmanager
+      tag: v0.27.0
+    storage:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: ceph-rbd
+          accessModes:
+          - ReadWriteOnce
+          resources:
+            requests:
+              storage: 50Gi
+prometheus:
+  enabled: true
+  service:
+    type: NodePort
+    nodePort: 30390
+  prometheusSpec:
+    replicas: 1
+    retention: 15d
+    scrapeInterval: 30s
+    evaluationInterval: 30s
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
+    scrapeConfigSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    serviceMonitorNamespaceSelector: {}
+    podMonitorNamespaceSelector: {}
+    probeNamespaceSelector: {}
+    scrapeConfigNamespaceSelector: {}
+    ruleNamespaceSelector: {}
+    image:
+      registry: registry.cn-global.starbucket.com.cn/starbucket
+      repository: quay.io/prometheus/prometheus
+      tag: v2.54.1
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: ceph-rbd
+          accessModes:
+          - ReadWriteOnce
+          resources:
+            requests:
+              storage: 50Gi
+    resources:
+      requests:
+        cpu: 500m
+        memory: 2Gi
+      limits:
+        cpu: '2'
+        memory: 4Gi
+prometheusOperator:
+  enabled: true
+  admissionWebhooks:
+    enabled: false
+    patch:
+      enabled: false
+  tls:
+    enabled: false
+  image:
+    registry: registry.cn-global.starbucket.com.cn/starbucket
+    repository: quay.io/prometheus-operator/prometheus-operator
+    tag: v0.77.2
+  prometheusConfigReloader:
+    image:
+      registry: registry.cn-global.starbucket.com.cn/starbucket
+      repository: quay.io/prometheus-operator/prometheus-config-reloader
+      tag: v0.77.2
+kube-state-metrics:
+  enabled: true
+  image:
+    registry: registry.cn-global.starbucket.com.cn/starbucket
+    repository: registry.k8s.io/kube-state-metrics/kube-state-metrics
+    tag: v2.13.0
+  kubeRBACProxy:
+    image:
+      registry: registry.cn-global.starbucket.com.cn/starbucket
+      repository: quay.io/brancz/kube-rbac-proxy
+      tag: v0.18.1
+prometheus-node-exporter:
+  enabled: true
+  image:
+    registry: registry.cn-global.starbucket.com.cn/starbucket
+    repository: docker.io/prom/node-exporter
+    tag: v1.8.2
+    digest: ''
+    pullPolicy: IfNotPresent
+  kubeRBACProxy:
+    image:
+      registry: registry.cn-global.starbucket.com.cn/starbucket
+      repository: quay.io/brancz/kube-rbac-proxy
+      tag: v0.18.1
+kubeEtcd:
+  enabled: false
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeProxy:
+  enabled: true
+kubelet:
+  enabled: true
+coreDns:
+  enabled: true
+kubeApiServer:
+  enabled: true

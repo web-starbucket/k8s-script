@@ -38,7 +38,7 @@ spec:
       name: default/eg/http
       operation:
         op: add
-        path: /default_filter_chain/filters/0/typed_config/http_filters/1/typed_config/mutations/response_mutations/-
+        path: /default_filter_chain/filters/0/typed_config/http_filters/0/typed_config/mutations/response_mutations/-
         value:
           append:
             header:

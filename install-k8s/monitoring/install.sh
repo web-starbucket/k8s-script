@@ -6,6 +6,7 @@
 #   bash install.sh destroy    # 仅删除
 #   bash install.sh reinstall  # 全部删除后重建
 # 跳过预拉: SKIP_IMAGE_PULL=1 bash install.sh
+# 存储后端: config.yaml 的 storage.type（nfs=静态 PV；ceph-rbd=动态供给，需先装 install-ceph 的 CSI）
 set -euo pipefail
 
 NS=monitoring
@@ -21,6 +22,23 @@ LOKI_PVC="storage-loki-0"
 LOKI_PV="pv-mon-loki"
 TEMPO_PVC="storage-tempo-0"
 TEMPO_PV="pv-mon-tempo"
+
+# 存储后端（config.yaml: storage.type / storage.storageClass）
+read -r STORAGE_TYPE STORAGE_CLASS < <(python3 - <<'PY'
+import os, yaml
+cfg = yaml.safe_load(open(os.path.join(os.environ.get("DIR", "."), "config.yaml"), encoding="utf-8"))
+s = cfg.get("storage") or {}
+t = str(s.get("type") or "nfs").strip().lower()
+sc = str(s.get("storageClass") or "ceph-rbd").strip()
+print(t or "nfs", sc or "ceph-rbd")
+PY
+)
+STORAGE_TYPE="${STORAGE_TYPE:-nfs}"
+STORAGE_CLASS="${STORAGE_CLASS:-ceph-rbd}"
+
+# kube-prometheus-stack chart 钉版（appVersion=operator v0.77.2，与 config.yaml 镜像钉版对应；
+# 升级时整套一起升：chart + operator/CRD/相关镜像）
+KPS_CHART_VERSION="${KPS_CHART_VERSION:-65.8.1}"
 
 # 节奏控制（可按机器调整）
 SLEEP_SHORT=3
@@ -153,10 +171,17 @@ is_local_ip() {
 }
 
 prefetch_images() {
-  local imgs=() img i n ip ok fail
+  local filter="${1:-}" imgs=() img i n ip ok fail
   log "所需镜像（来自 config.yaml）"
   while IFS= read -r img; do
-    [ -n "$img" ] && imgs+=("$img")
+    [ -n "$img" ] || continue
+    if [ -n "$filter" ]; then
+      case "$img" in
+        *"$filter"*) ;;
+        *) continue ;;
+      esac
+    fi
+    imgs+=("$img")
   done < <(list_images)
   if [ "${#imgs[@]}" -eq 0 ]; then
     echo "错误: 未从 config.yaml 解析到镜像"
@@ -198,7 +223,7 @@ prefetch_images() {
   done < <(conf_node_ips)
 
   if [ "$n" -eq 0 ]; then
-    log "未从 ${K8S_NODES_FILE} 解析到其它节点；DaemonSet（node-exporter / Promtail）请在各节点自行 crictl pull"
+    log "未从 ${K8S_NODES_FILE} 解析到其它节点；DaemonSet（node-exporter / Alloy）请在各节点自行 crictl pull"
     return 0
   fi
 
@@ -277,13 +302,17 @@ install_prometheus_crds() {
   mkdir -p "$crd_dir"
   (
     cd "$crd_dir"
-    helm pull prometheus-community/kube-prometheus-stack --untar 2>/dev/null \
-      || helm pull prometheus-community/kube-prometheus-stack --untar
+    helm pull prometheus-community/kube-prometheus-stack --version "$KPS_CHART_VERSION" --untar 2>/dev/null \
+      || helm pull prometheus-community/kube-prometheus-stack --version "$KPS_CHART_VERSION" --untar
   )
 
+  # 新版 chart 结构：纯 CRD 在 charts/crds/crds/crd-*.yaml。
+  # 按内容筛（kind: CustomResourceDefinition 且无 helm 模板语法），避免误 apply values.yaml
   local f n=0
   while IFS= read -r f; do
     [ -f "$f" ] || continue
+    grep -q '^kind: CustomResourceDefinition' "$f" 2>/dev/null || continue
+    grep -q '{{' "$f" 2>/dev/null && continue
     n=$((n + 1))
     wait_api
     log "apply CRD: $(basename "$f")"
@@ -291,8 +320,8 @@ install_prometheus_crds() {
       || kubectl apply -f "$f"
     sleep 1
   done < <(find "$crd_dir" -type f \( -name '*.yaml' -o -name '*.yml' \) \
-    | grep -E '/crds/' \
-    | grep -viE '/tests/|/templates/' \
+    | grep -viE '/tests/|/templates/|/ci/' \
+    | sort \
     || true)
 
   if [ "$n" -eq 0 ]; then
@@ -349,32 +378,57 @@ os.makedirs(tmp, exist_ok=True)
 with open(cfg_path, encoding="utf-8") as f:
     cfg = yaml.safe_load(f)
 
-nfs = cfg["nfs"]
-server = nfs["server"]
-base_path = nfs["basePath"].rstrip("/")
+storage = cfg.get("storage") or {}
+storage_type = str(storage.get("type") or "nfs").strip().lower()
+storage_class = str(storage.get("storageClass") or "ceph-rbd").strip()
+storage_size = str(storage.get("size") or "").strip()
+if storage_type not in ("nfs", "ceph-rbd"):
+    raise SystemExit(f"storage.type 只支持 nfs | ceph-rbd，当前: {storage_type!r}")
+
+nfs = cfg.get("nfs") or {}
+server = str(nfs.get("server") or "").strip()
+base_path = str(nfs.get("basePath") or "").rstrip("/")
+if storage_type == "nfs" and (not server or not base_path):
+    raise SystemExit("storage.type=nfs 需要 config.yaml 里的 nfs.server / nfs.basePath")
+
+# 清掉上次生成的 PV/PVC 清单，避免切换存储后端/采集器后旧文件被误 apply
+for stale in os.listdir(tmp):
+    if (stale[:2].isdigit() and stale.endswith(".yaml")) or stale in ("loki-pvc.yaml", "tempo-pvc.yaml", "promtail.yaml"):
+        os.remove(os.path.join(tmp, stale))
 
 # 拆成多个小文件，串行 apply
 parts = {
-  "00-ns.yaml": f"""apiVersion: v1
+  "00-ns.yaml": """apiVersion: v1
 kind: Namespace
 metadata:
   name: monitoring
 """,
-  "01-pv-grafana.yaml": f"""apiVersion: v1
+}
+
+if storage_type == "nfs":
+    # 静态 NFS PV（grafana 的 PV+PVC 同文件；loki/tempo 的 PVC 见下方单独文件）
+    for i, (name, size) in enumerate(
+        [("grafana", "10Gi"), ("prometheus", "50Gi"), ("alertmanager", "5Gi"),
+         ("loki", "50Gi"), ("tempo", "20Gi")], start=1):
+        if storage_size:
+            size = storage_size
+        body = f"""apiVersion: v1
 kind: PersistentVolume
 metadata:
-  name: pv-mon-grafana
+  name: pv-mon-{name}
 spec:
   capacity:
-    storage: 10Gi
+    storage: {size}
   accessModes: ["ReadWriteMany"]
   persistentVolumeReclaimPolicy: Retain
   storageClassName: ""
   mountOptions: ["nfsvers=4.1", "hard", "timeo=600"]
   nfs:
     server: {server}
-    path: {base_path}/grafana
----
+    path: {base_path}/{name}
+"""
+        if name == "grafana":
+            body += f"""---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -386,76 +440,32 @@ spec:
   volumeName: pv-mon-grafana
   resources:
     requests:
-      storage: 10Gi
-""",
-  "02-pv-prometheus.yaml": f"""apiVersion: v1
-kind: PersistentVolume
+      storage: {size}
+"""
+        parts[f"{i:02d}-pv-{name}.yaml"] = body
+else:
+    # ceph-rbd：Grafana 用动态 PVC；Loki/Tempo/Prometheus/Alertmanager 由各自
+    # volumeClaimTemplate 按 storageClassName 自动供给（见下方 values 改写）
+    parts["01-pvc-grafana.yaml"] = f"""apiVersion: v1
+kind: PersistentVolumeClaim
 metadata:
-  name: pv-mon-prometheus
+  name: data-grafana
+  namespace: monitoring
 spec:
-  capacity:
-    storage: 50Gi
-  accessModes: ["ReadWriteMany"]
-  persistentVolumeReclaimPolicy: Retain
-  storageClassName: ""
-  mountOptions: ["nfsvers=4.1", "hard", "timeo=600"]
-  nfs:
-    server: {server}
-    path: {base_path}/prometheus
-""",
-  "03-pv-alertmanager.yaml": f"""apiVersion: v1
-kind: PersistentVolume
-metadata:
-  name: pv-mon-alertmanager
-spec:
-  capacity:
-    storage: 5Gi
-  accessModes: ["ReadWriteMany"]
-  persistentVolumeReclaimPolicy: Retain
-  storageClassName: ""
-  mountOptions: ["nfsvers=4.1", "hard", "timeo=600"]
-  nfs:
-    server: {server}
-    path: {base_path}/alertmanager
-""",
-  "04-pv-loki.yaml": f"""apiVersion: v1
-kind: PersistentVolume
-metadata:
-  name: pv-mon-loki
-spec:
-  capacity:
-    storage: 50Gi
-  accessModes: ["ReadWriteMany"]
-  persistentVolumeReclaimPolicy: Retain
-  storageClassName: ""
-  mountOptions: ["nfsvers=4.1", "hard", "timeo=600"]
-  nfs:
-    server: {server}
-    path: {base_path}/loki
-""",
-  "05-pv-tempo.yaml": f"""apiVersion: v1
-kind: PersistentVolume
-metadata:
-  name: pv-mon-tempo
-spec:
-  capacity:
-    storage: 20Gi
-  accessModes: ["ReadWriteMany"]
-  persistentVolumeReclaimPolicy: Retain
-  storageClassName: ""
-  mountOptions: ["nfsvers=4.1", "hard", "timeo=600"]
-  nfs:
-    server: {server}
-    path: {base_path}/tempo
-""",
-}
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: {storage_class}
+  resources:
+    requests:
+      storage: {storage_size or "10Gi"}
+"""
 
 for name, content in parts.items():
     with open(os.path.join(tmp, name), "w", encoding="utf-8") as f:
         f.write(content)
 
-with open(os.path.join(tmp, "loki-pvc.yaml"), "w", encoding="utf-8") as f:
-    f.write(f"""apiVersion: v1
+if storage_type == "nfs":
+    with open(os.path.join(tmp, "loki-pvc.yaml"), "w", encoding="utf-8") as f:
+        f.write(f"""apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: storage-loki-0
@@ -472,8 +482,8 @@ spec:
       storage: 50Gi
 """)
 
-with open(os.path.join(tmp, "tempo-pvc.yaml"), "w", encoding="utf-8") as f:
-    f.write(f"""apiVersion: v1
+    with open(os.path.join(tmp, "tempo-pvc.yaml"), "w", encoding="utf-8") as f:
+        f.write(f"""apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: storage-tempo-0
@@ -507,28 +517,64 @@ loki.setdefault("singleBinary", {})["replicas"] = 0
 tempo = cfg["tempo"]
 tempo["replicas"] = 0
 
+# 四个存储声明的引用（ceph 改写与统一容量都会用到）
+am_vct = (((kp.get("alertmanager") or {}).get("alertmanagerSpec") or {})
+          .get("storage") or {}).get("volumeClaimTemplate", {}).get("spec") or {}
+pm_vct = (((kp.get("prometheus") or {}).get("prometheusSpec") or {})
+          .get("storageSpec") or {}).get("volumeClaimTemplate", {}).get("spec") or {}
+loki_p = (loki.get("singleBinary") or {}).setdefault("persistence", {})
+tempo_p = tempo.setdefault("persistence", {})
+
+if storage_type == "ceph-rbd":
+    # 动态供给：去静态绑定（volumeName / 空 storageClassName），改 RWO + ceph-rbd
+    # 注意字段名不同：loki chart 用 storageClass，tempo chart 用 storageClassName
+    am_vct.pop("volumeName", None)
+    am_vct["storageClassName"] = storage_class
+    am_vct["accessModes"] = ["ReadWriteOnce"]
+    pm_vct.pop("volumeName", None)
+    pm_vct["storageClassName"] = storage_class
+    pm_vct["accessModes"] = ["ReadWriteOnce"]
+    loki_p["storageClass"] = storage_class
+    loki_p["accessModes"] = ["ReadWriteOnce"]
+    tempo_p["storageClassName"] = storage_class
+    tempo_p["accessModes"] = ["ReadWriteOnce"]
+
+if storage_size:
+    # storage.size 统一覆盖 5 个组件的 PVC 容量
+    for vct in (am_vct, pm_vct):
+        vct.setdefault("resources", {}).setdefault("requests", {})["storage"] = storage_size
+    loki_p["size"] = storage_size
+    tempo_p["size"] = storage_size
+
 for name, data in [
     ("kube-prometheus.yaml", kp),
     ("loki.yaml", loki),
-    ("promtail.yaml", cfg["promtail"]),
+    ("alloy.yaml", cfg["alloy"]),
     ("tempo.yaml", tempo),
 ]:
     with open(os.path.join(tmp, name), "w", encoding="utf-8") as f:
         yaml.safe_dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
 
 print("generated:", tmp)
-print("NFS 目录权限（在 {server} 执行）:".format(server=server))
-print(f"  mkdir -p {base_path}/{{prometheus,grafana,alertmanager,loki,tempo}}")
-print(f"  chown -R 472:472 {base_path}/grafana")
-print(f"  chown -R 1000:2000 {base_path}/prometheus")
-print(f"  chown -R 1000:2000 {base_path}/alertmanager")
-print(f"  chown -R 10001:10001 {base_path}/loki")
-print(f"  chown -R 10001:10001 {base_path}/tempo")
+print(f"storage.type = {storage_type}")
+if storage_size:
+    print(f"storage.size = {storage_size}（统一覆盖 5 个组件 PVC 容量）")
+if storage_type == "nfs":
+    print("NFS 目录权限（在 {server} 执行）:".format(server=server))
+    print(f"  mkdir -p {base_path}/{{prometheus,grafana,alertmanager,loki,tempo}}")
+    print(f"  chown -R 472:472 {base_path}/grafana")
+    print(f"  chown -R 1000:2000 {base_path}/prometheus")
+    print(f"  chown -R 1000:2000 {base_path}/alertmanager")
+    print(f"  chown -R 10001:10001 {base_path}/loki")
+    print(f"  chown -R 10001:10001 {base_path}/tempo")
+else:
+    print(f"ceph-rbd 动态供给：StorageClass={storage_class}（先确认 kubectl get sc 有它）")
+    print("RWO 卷属主由 fsGroup 自动处理，无需预建目录/chown")
 PY
 }
 
-apply_nfs_slow() {
-  log "串行应用 NFS 清单"
+apply_storage_manifests() {
+  log "串行应用存储清单（storage.type=${STORAGE_TYPE}）"
   local f
   for f in "$TMP"/0*.yaml; do
     [ -f "$f" ] || continue
@@ -561,6 +607,9 @@ wait_ns_gone() {
 
 destroy() {
   echo "======== 删除全部监控（串行）========"
+  if [ "$STORAGE_TYPE" = "ceph-rbd" ]; then
+    echo "注意: ceph-rbd 动态卷 reclaimPolicy=Delete，PVC 删除后 RBD 数据不可恢复"
+  fi
   wait_api
 
   log "缩容 Loki"
@@ -569,7 +618,7 @@ destroy() {
 
   log "卸载 Helm（逐个）"
   wait_api
-  helm -n "$NS" uninstall promtail 2>/dev/null || true
+  helm -n "$NS" uninstall alloy promtail 2>/dev/null || true
   pause "$SLEEP_STEP"
   wait_api
   helm -n "$NS" uninstall tempo 2>/dev/null || true
@@ -670,6 +719,27 @@ ensure_loki_pvc() {
   pause "$SLEEP_STEP"
 }
 
+# ceph-rbd 模式：PVC 由 volumeClaimTemplate 动态供给，只需等 Bound
+wait_pvc_bound() {
+  local pvc="$1" phase i
+  log "等待 PVC ${pvc} 动态供给 Bound"
+  for i in $(seq 1 60); do
+    phase=$(kubectl -n "$NS" get pvc "$pvc" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+    if [ "$phase" = "Bound" ]; then
+      kubectl -n "$NS" get pvc "$pvc"
+      return 0
+    fi
+    sleep 2
+  done
+  if ! kubectl -n "$NS" get pvc "$pvc" >/dev/null 2>&1; then
+    echo "错误: PVC ${pvc} 不存在（STS volumeClaimTemplate 未创建它；ceph-rbd 模式应直接 replicas=1 安装）"
+  else
+    echo "错误: PVC ${pvc} 未 Bound（检查 StorageClass ${STORAGE_CLASS} / ceph-csi 插件 / Ceph 连通性）"
+    kubectl -n "$NS" describe pvc "$pvc" 2>/dev/null | tail -20 || true
+  fi
+  exit 1
+}
+
 ensure_tempo_pvc() {
   log "校正 Tempo PVC (${TEMPO_PVC})"
   kubectl -n "$NS" scale sts tempo --replicas=0 2>/dev/null || true
@@ -753,13 +823,113 @@ fix_node_exporter() {
   pause "$SLEEP_STEP"
 }
 
+# Tempo 部署段（install_all 与单独安装共用）
+deploy_tempo() {
+  # 手工装过、没有 volumeClaimTemplates 的 Tempo 无法原地加持久卷，先删 STS
+  if kubectl -n "$NS" get sts tempo >/dev/null 2>&1; then
+    vct=$(kubectl -n "$NS" get sts tempo -o jsonpath='{.spec.volumeClaimTemplates}' 2>/dev/null || true)
+    if [ -z "$vct" ] || [ "$vct" = "[]" ]; then
+      log "已有 Tempo STS 未挂 PVC，删除以便改用持久卷（emptyDir 数据会丢失）"
+      kubectl -n "$NS" delete sts tempo --wait=false --ignore-not-found 2>/dev/null || true
+      pause "$SLEEP_STEP"
+    fi
+  fi
+
+  if [ "$STORAGE_TYPE" = "ceph-rbd" ]; then
+    # 动态供给：STS 在 replicas=0 时不会创建 PVC，直接 1 副本安装，
+    # volumeClaimTemplate 会自动创建并供给（volumeBindingMode=Immediate）
+    helm_retry "安装 Tempo" \
+      helm upgrade --install tempo grafana/tempo \
+        -n "$NS" \
+        -f "$TMP/tempo.yaml" \
+        --set replicas=1 \
+        --timeout 30m \
+        --wait=false
+    wait_pvc_bound "$TEMPO_PVC"
+    log "等待 Tempo STS 就绪"
+    kubectl -n "$NS" rollout status sts/tempo --timeout=300s || true
+  else
+    helm_retry "安装 Tempo(replicas=0)" \
+      helm upgrade --install tempo grafana/tempo \
+        -n "$NS" \
+        -f "$TMP/tempo.yaml" \
+        --set replicas=0 \
+        --timeout 30m \
+        --wait=false
+
+    for i in $(seq 1 40); do
+      kubectl -n "$NS" get sts tempo >/dev/null 2>&1 && break
+      sleep 3
+    done
+
+    ensure_tempo_pvc
+
+    log "拉起 Tempo replicas=1"
+    kubectl -n "$NS" scale sts tempo --replicas=1
+    pause "$SLEEP_STEP"
+
+    helm_retry "同步 Tempo(replicas=1)" \
+      helm upgrade tempo grafana/tempo \
+        -n "$NS" \
+        -f "$TMP/tempo.yaml" \
+        --set replicas=1 \
+        --timeout 30m \
+        --wait=false
+  fi
+
+  patch_tempo_otlp_grpc
+}
+
+# 只装 Tempo（不动 Prometheus/Loki/Alloy；用于先解决 x-trace-id 等链路追踪需求）
+install_tempo() {
+  export DIR
+  echo "======== 单独安装 Tempo（storage.type=${STORAGE_TYPE}）========"
+  need_py
+  gen
+  wait_api
+  if [ "$STORAGE_TYPE" = "ceph-rbd" ]; then
+    kubectl get sc "$STORAGE_CLASS" >/dev/null 2>&1 \
+      || { echo "错误: 未找到 StorageClass ${STORAGE_CLASS}（先装 install-ceph 的 CSI 并 apply csi/generated/）"; exit 1; }
+    log "存储后端: ceph-rbd（StorageClass=${STORAGE_CLASS}，动态供给 RWO）"
+  else
+    log "存储后端: nfs（静态 PV）"
+  fi
+  kubectl apply -f "$TMP/00-ns.yaml"
+  pause "$SLEEP_SHORT"
+  if [ "$STORAGE_TYPE" = "nfs" ]; then
+    kubectl apply -f "$TMP/05-pv-tempo.yaml"
+    pause "$SLEEP_SHORT"
+  fi
+  log "更新 Grafana Helm 仓库"
+  helm repo add grafana https://grafana.github.io/helm-charts 2>/dev/null || true
+  sleep 2
+  helm repo update grafana 2>/dev/null || helm repo update
+  prefetch_images tempo
+  deploy_tempo
+
+  echo "======== Tempo 状态 ========"
+  kubectl -n "$NS" get pod,pvc,svc -l app.kubernetes.io/name=tempo
+  echo ""
+  echo "OTLP 接入地址（Envoy Gateway 的 eg-proxy.yaml 指向这里）:"
+  echo "  gRPC: tempo.monitoring.svc.cluster.local:4317"
+  echo "  HTTP: tempo.monitoring.svc.cluster.local:4318"
+}
+
 install_all() {
   export DIR
   echo "======== 安装监控（低并发串行）========"
   prefetch_images
   gen
   wait_api
-  apply_nfs_slow
+  if [ "$STORAGE_TYPE" = "ceph-rbd" ]; then
+    kubectl get sc "$STORAGE_CLASS" >/dev/null 2>&1 \
+      || { echo "错误: 未找到 StorageClass ${STORAGE_CLASS}"; \
+           echo "先在 install-ceph 完成 bootstrap/add-hosts/osd/pool/export-rbd，并在本集群 apply csi/generated/"; exit 1; }
+    log "存储后端: ceph-rbd（StorageClass=${STORAGE_CLASS}，动态供给 RWO）"
+  else
+    log "存储后端: nfs（静态 PV）"
+  fi
+  apply_storage_manifests
 
   log "更新 Helm 仓库"
   helm repo add prometheus-community https://prometheus-community.github.io/helm-charts 2>/dev/null || true
@@ -782,6 +952,7 @@ install_all() {
   helm_retry "安装 kube-prometheus-stack(skip-crds)" \
     helm upgrade --install kube-prometheus prometheus-community/kube-prometheus-stack \
       -n "$NS" \
+      --version "$KPS_CHART_VERSION" \
       -f "$TMP/kube-prometheus.yaml" \
       --set prometheus-node-exporter.image.registry=registry.cn-global.starbucket.com.cn/starbucket \
       --set prometheus-node-exporter.image.repository=docker.io/prom/node-exporter \
@@ -798,6 +969,7 @@ install_all() {
     helm_retry "安装 kube-prometheus-stack(含CRD)" \
       helm upgrade --install kube-prometheus prometheus-community/kube-prometheus-stack \
         -n "$NS" \
+        --version "$KPS_CHART_VERSION" \
         -f "$TMP/kube-prometheus.yaml" \
         --set prometheus-node-exporter.image.registry=registry.cn-global.starbucket.com.cn/starbucket \
         --set prometheus-node-exporter.image.repository=docker.io/prom/node-exporter \
@@ -810,78 +982,62 @@ install_all() {
   pause 60
   fix_node_exporter
 
-  helm_retry "安装 Loki(replicas=0)" \
-    helm upgrade --install loki grafana/loki \
-      -n "$NS" \
-      -f "$TMP/loki.yaml" \
-      --set singleBinary.replicas=0 \
-      --timeout 30m \
-      --wait=false
+  if [ "$STORAGE_TYPE" = "ceph-rbd" ]; then
+    # 动态供给：STS 在 replicas=0 时不会创建 PVC，直接 1 副本安装
+    helm_retry "安装 Loki" \
+      helm upgrade --install loki grafana/loki \
+        -n "$NS" \
+        -f "$TMP/loki.yaml" \
+        --set singleBinary.replicas=1 \
+        --timeout 30m \
+        --wait=false
+    wait_pvc_bound "$LOKI_PVC"
+    log "等待 Loki STS 就绪"
+    kubectl -n "$NS" rollout status sts/loki --timeout=300s || true
+  else
+    helm_retry "安装 Loki(replicas=0)" \
+      helm upgrade --install loki grafana/loki \
+        -n "$NS" \
+        -f "$TMP/loki.yaml" \
+        --set singleBinary.replicas=0 \
+        --timeout 30m \
+        --wait=false
 
-  for i in $(seq 1 40); do
-    kubectl -n "$NS" get sts loki >/dev/null 2>&1 && break
-    sleep 3
-  done
+    for i in $(seq 1 40); do
+      kubectl -n "$NS" get sts loki >/dev/null 2>&1 && break
+      sleep 3
+    done
 
-  ensure_loki_pvc
+    ensure_loki_pvc
 
-  log "拉起 Loki replicas=1"
-  kubectl -n "$NS" scale sts loki --replicas=1
-  pause "$SLEEP_STEP"
+    log "拉起 Loki replicas=1"
+    kubectl -n "$NS" scale sts loki --replicas=1
+    pause "$SLEEP_STEP"
 
-  helm_retry "同步 Loki(replicas=1)" \
-    helm upgrade loki grafana/loki \
-      -n "$NS" \
-      -f "$TMP/loki.yaml" \
-      --set singleBinary.replicas=1 \
-      --timeout 30m \
-      --wait=false
-
-  helm_retry "安装 Promtail" \
-    helm upgrade --install promtail grafana/promtail \
-      -n "$NS" \
-      -f "$TMP/promtail.yaml" \
-      --timeout 30m \
-      --wait=false
-
-  # 手工装过、没有 volumeClaimTemplates 的 Tempo 无法原地加 NFS，先删 STS
-  if kubectl -n "$NS" get sts tempo >/dev/null 2>&1; then
-    vct=$(kubectl -n "$NS" get sts tempo -o jsonpath='{.spec.volumeClaimTemplates}' 2>/dev/null || true)
-    if [ -z "$vct" ] || [ "$vct" = "[]" ]; then
-      log "已有 Tempo STS 未挂 PVC，删除以便改用 NFS（emptyDir 数据会丢失）"
-      kubectl -n "$NS" delete sts tempo --wait=false --ignore-not-found 2>/dev/null || true
-      pause "$SLEEP_STEP"
-    fi
+    helm_retry "同步 Loki(replicas=1)" \
+      helm upgrade loki grafana/loki \
+        -n "$NS" \
+        -f "$TMP/loki.yaml" \
+        --set singleBinary.replicas=1 \
+        --timeout 30m \
+        --wait=false
   fi
 
-  helm_retry "安装 Tempo(replicas=0)" \
-    helm upgrade --install tempo grafana/tempo \
+  # 6. Alloy（日志采集，替代 Promtail；如有旧 Promtail 先卸载）
+  log "安装 Alloy"
+  if helm -n "$NS" status promtail >/dev/null 2>&1; then
+    log "检测到旧 Promtail，卸载（日志采集由 Alloy 接管）"
+    helm -n "$NS" uninstall promtail || true
+    pause "$SLEEP_STEP"
+  fi
+  helm_retry "安装 Alloy" \
+    helm upgrade --install alloy grafana/alloy \
       -n "$NS" \
-      -f "$TMP/tempo.yaml" \
-      --set replicas=0 \
+      -f "$TMP/alloy.yaml" \
       --timeout 30m \
       --wait=false
 
-  for i in $(seq 1 40); do
-    kubectl -n "$NS" get sts tempo >/dev/null 2>&1 && break
-    sleep 3
-  done
-
-  ensure_tempo_pvc
-
-  log "拉起 Tempo replicas=1"
-  kubectl -n "$NS" scale sts tempo --replicas=1
-  pause "$SLEEP_STEP"
-
-  helm_retry "同步 Tempo(replicas=1)" \
-    helm upgrade tempo grafana/tempo \
-      -n "$NS" \
-      -f "$TMP/tempo.yaml" \
-      --set replicas=1 \
-      --timeout 30m \
-      --wait=false
-
-  patch_tempo_otlp_grpc
+  deploy_tempo
 
   echo "======== 状态 ========"
   pause "$SLEEP_STEP"
@@ -899,6 +1055,9 @@ install_all() {
 
 cmd="${1:-install}"
 case "$cmd" in
+  tempo)
+    install_tempo
+    ;;
   destroy|uninstall|delete)
     destroy
     ;;
@@ -915,7 +1074,7 @@ case "$cmd" in
     install_all
     ;;
   *)
-    echo "用法: bash install.sh [install|images|reinstall|destroy]"
+    echo "用法: bash install.sh [install|tempo|images|reinstall|destroy]"
     exit 1
     ;;
 esac

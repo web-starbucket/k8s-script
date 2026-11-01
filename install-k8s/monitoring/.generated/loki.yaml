@@ -1,0 +1,90 @@
+deploymentMode: SingleBinary
+loki:
+  auth_enabled: false
+  commonConfig:
+    replication_factor: 1
+  schemaConfig:
+    configs:
+    - from: '2024-01-01'
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+  storage:
+    type: filesystem
+  limits_config:
+    retention_period: 2160h
+  compactor:
+    working_directory: /var/loki/compactor
+    compaction_interval: 10m
+    retention_enabled: true
+    retention_delete_delay: 2h
+    delete_request_store: filesystem
+  image:
+    registry: registry.cn-global.starbucket.com.cn/starbucket
+    repository: docker.io/grafana/loki
+    tag: 3.3.2
+singleBinary:
+  replicas: 0
+  persistence:
+    enabled: true
+    size: 50Gi
+    storageClass: ceph-rbd
+    enableStatefulSetAutoDeletePVC: false
+    whenDeleted: Retain
+    whenScaled: Retain
+    accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      cpu: '1'
+      memory: 2Gi
+sidecar:
+  image:
+    repository: registry.cn-global.starbucket.com.cn/starbucket/quay.io/kiwigrid/k8s-sidecar
+  rules:
+    enabled: false
+read:
+  replicas: 0
+  persistence:
+    enabled: false
+write:
+  replicas: 0
+  persistence:
+    enabled: false
+    volumeClaimsEnabled: false
+backend:
+  replicas: 0
+  persistence:
+    enabled: false
+    volumeClaimsEnabled: false
+gateway:
+  enabled: true
+  image:
+    registry: registry.cn-global.starbucket.com.cn/starbucket
+    repository: docker.io/nginxinc/nginx-unprivileged
+    tag: 1.27.2-alpine
+  service:
+    type: ClusterIP
+chunksCache:
+  enabled: false
+resultsCache:
+  enabled: false
+test:
+  enabled: false
+lokiCanary:
+  enabled: false
+monitoring:
+  selfMonitoring:
+    enabled: false
+    grafanaAgent:
+      installOperator: false
+  lokiCanary:
+    enabled: false
+  rules:
+    enabled: false
