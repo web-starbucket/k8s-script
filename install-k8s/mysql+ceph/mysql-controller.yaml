@@ -6,13 +6,11 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: mysql-controller
-  namespace: default
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: mysql-controller
-  namespace: default
 rules:
   - apiGroups: [""]
     resources: ["pods", "pods/exec", "configmaps", "secrets"]
@@ -22,7 +20,6 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: mysql-controller
-  namespace: default
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -36,7 +33,6 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: mysql-controller
-  namespace: default
 data:
   run.sh: |
     #!/bin/bash
@@ -534,7 +530,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: mysql-controller
-  namespace: default
 spec:
   replicas: 1
   selector:

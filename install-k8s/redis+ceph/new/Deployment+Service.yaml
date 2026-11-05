@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: predixy
+  namespace: dev
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: predixy
+  template:
+    metadata:
+      labels:
+        app: predixy
+    spec:
+      containers:
+        - name: predixy
+          image: opsource/predixy:latest
+          command: ["/usr/local/bin/predixy", "/etc/predixy/predixy.conf"]
+          ports:
+            - containerPort: 7617
+          volumeMounts:
+            - name: config
+              mountPath: /etc/predixy
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: predixy-config
+
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: predixy
+  namespace: dev
+spec:
+  type: ClusterIP
+  selector:
+    app: predixy
+  ports:
+    - port: 7617
+      targetPort: 7617
+      name: predixy

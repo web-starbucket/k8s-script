@@ -132,6 +132,7 @@ bash install.sh destroy      # 仅删除（同上）
 | Grafana | `http://<节点IP>:30300` | admin / admin123456 |
 | Prometheus | `http://<节点IP>:30390` | - |
 | Alertmanager | `http://<节点IP>:30303` | - |
+| Loki Gateway | `http://<节点IP>:30310` | 日志查询 API（供夜莺等集群外系统对接；不需要可在 config.yaml 改回 ClusterIP） |
 
 ```bash
 # 查 Grafana 密码
@@ -191,7 +192,43 @@ kubectl -n default run logtest --rm -i \
 
 #### 5.4 告警（Alertmanager）
 
-默认告警规则已加载（节点/集群级）。接收通知需在业务 namespace 建 `AlertmanagerConfig`（见第 6 节），或改 `config.yaml` 的 alertmanager 段配置全局 receiver。
+默认告警规则已加载（节点/集群级）。**告警邮件走 Alertmanager**（`config.yaml` → `kubePrometheus.alertmanager.config`，企业邮箱 587 STARTTLS 模板已内置，填好 `smtp_smarthost` / `smtp_auth_username` / `smtp_auth_password` / 收件人后 `bash install.sh` 生效）。
+
+测试告警发送（注意：Alertmanager 0.27+ 已删除 v1 API，必须用 **v2** 端点）：
+
+```bash
+# 不带 startsAt/endsAt，由 Alertmanager 自动填当前时间
+# （自填 startsAt 必须是过去时间：缺省 endsAt=接收时刻+5min，start 晚于它会报 start time must be before end time）
+curl -X POST http://<节点IP>:30303/api/v2/alerts -H 'Content-Type: application/json' -d '[{
+  "labels": {"alertname": "TestAlert", "severity": "info", "namespace": "default"},
+  "annotations": {"summary": "测试告警邮件"}
+}]'
+# 收件箱应在 ~30s（group_wait）内收到；查 Alertmanager 日志排错：
+kubectl -n monitoring logs alertmanager-monitoring-alertmanager-0 -c alertmanager --tail=50
+```
+
+业务分区在自己的 namespace 建 `AlertmanagerConfig` 可分流给不同收件人（见第 6 节）。
+
+> 注意：Grafana 页面里的 contact point「Test」按钮走的是 **Grafana 自己的 SMTP**（`grafana.ini [smtp]`，config.yaml 已内置模板），与 Alertmanager 是两条独立链路。
+
+#### 5.5 自建告警规则（Grafana 页面）
+
+**Alerting → Alert rules → New alert rule**：查询（A）→ Reduce（B, Last）→ Threshold（C, IS ABOVE 阈值，设为 Condition）→ 评估间隔 1m / pending 5m（防抖）→ 打 label（severity/team，供 Notification policies 分流）→ 选 contact point。
+
+性能告警（Prometheus 数据源，示例：Pod CPU 超 limit 80%）：
+
+```promql
+sum by (namespace, pod) (rate(container_cpu_usage_seconds_total{container!="", namespace="prod"}[5m]))
+  / sum by (namespace, pod) (kube_pod_container_resource_limits{resource="cpu", namespace="prod"})
+```
+
+日志告警（Loki 数据源，**Query type 选 Instant**；示例：5 分钟错误日志超 10 条）：
+
+```logql
+sum by (namespace) (count_over_time({namespace="prod"} |~ "(?i)error|exception|panic" [5m]))
+```
+
+> 基础设施告警（节点/CPU/内存/磁盘/Pod 重启）kube-prometheus-stack 已内置整套 PrometheusRule，走 Alertmanager 发邮件，无需自建。系统级自定义规则建议用 PrometheusRule CR（YAML 版本管理），业务告警用 Grafana 页面。
 
 ---
 
@@ -289,6 +326,7 @@ NFS 模式的 PV 是 `Retain`，destroy 后数据仍在 NFS 目录。
 | Prometheus Crash `permission denied`（仅 NFS 模式） | NFS 目录属主错：`chown -R 1000:2000 .../prometheus`，删 `queries.active` 后重启 Pod |
 | Grafana init `chown: Operation not permitted`（仅 NFS 模式） | NFS 不支持容器内 chown；保持 `initChownData.enabled: false` 并预 chown 472:472 |
 | x-trace-id 响应头为空 | EG 未开 tracing：apply `../gateway-api/eg-proxy.yaml`（telemetry.tracing → tempo:4317）+ `examples/envoypatch-echo-request-id.yaml`；patch Programmed=False 报 `unknown field "mutations"` 是 http_filters 下标打错（见该文件头注释） |
+| Alertmanager 配置不生效（receivers 全是 null） | 开了 `alertmanagerConfigSelector` 后 Pod 挂的是 operator 生成的 `alertmanager-*-generated` secret，不是 chart 的 base secret；operator 日志若报 `undefined receiver "null" used in route`：`receivers` 列表覆盖了 chart 默认（helm 列表是整体替换），默认 Watchdog 路由引用的 `null` 接收器没了——在 receivers 里补 `- name: "null"` |
 
 常用排查命令：
 

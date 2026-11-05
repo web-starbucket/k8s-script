@@ -18,6 +18,11 @@ nfs:
   server: 172.16.10.129
   basePath: /data/nfs/shared/monitoring
 
+# ----- 敏感信息（不进 helm values，install.sh 据此创建 k8s Secret）-----
+# grafana.ini 的 smtp.password 用 $__env{SMTP_PASSWORD} 引用此处的值
+secrets:
+  smtpPassword: 'REPLACE_ME'   # ← Grafana 发邮件用的 SMTP 授权码（同 alertmanager 的 smtp_auth_password）
+
 # ----- kube-prometheus-stack -----
 kubePrometheus:
   fullnameOverride: monitoring
@@ -35,6 +40,23 @@ kubePrometheus:
     grafana.ini:
       users:
         default_language: zh-Hans
+      # Grafana 自带告警（页面上配的 contact point / 告警规则）走这个 SMTP 发邮件；
+      # 与 Alertmanager 是两条独立链路：PrometheusRule 走 Alertmanager，Grafana 页面建的规则走这里
+      smtp:
+        enabled: true
+        host: smtp.qq.com:587              # ← 同 Alertmanager 的 SMTP 主机
+        user: starbucket@qq.com            # ← 账号
+        password: $__env{SMTP_PASSWORD}    # chart 禁止明文（assertNoLeakedSecrets）；从 Secret grafana-smtp 注环境变量
+        from_address: starbucket@qq.com    # ← 发件人（=账号）
+        from_name: 'Grafana 监控告警'
+        startTLS_policy: MandatoryStartTLS  # 587=STARTTLS；Grafana 不支持 465 隐式 SSL，请用 587
+        skip_verify: true
+    # smtp 密码通过环境变量注入（引用 install.sh 自动创建的 grafana-smtp Secret）
+    envValueFrom:
+      SMTP_PASSWORD:
+        secretKeyRef:
+          name: grafana-smtp
+          key: password
     sidecar:
       image:
         registry: registry.cn-global.starbucket.com.cn/starbucket
@@ -90,6 +112,31 @@ kubePrometheus:
       type: Recreate
   alertmanager:
     enabled: true
+    # 全局告警邮件（企业邮箱 587 STARTTLS）；业务分区可另建 AlertmanagerConfig 分流给不同收件人
+    config:
+      global:
+        smtp_smarthost: 'smtp.qq.com:587'     # ← 改成你的 SMTP 主机:587
+        smtp_from: 'starbucket@qq.com'             # ← 发件人（通常=账号）
+        smtp_auth_username: 'starbucket@qq.com'    # ← SMTP 账号
+        smtp_auth_password: 'rmqiqlrpysqpfdae'           # ← 授权码/密码（企业邮箱多用客户端授权码，非登录密码）
+        smtp_require_tls: true                     # 587 = STARTTLS
+        resolve_timeout: 5m
+      route:
+        receiver: email
+        group_by: ['namespace', 'alertname', 'severity']
+        group_wait: 30s          # 首条告警等 30s 聚合同组
+        group_interval: 5m       # 同组新增告警的合并间隔
+        repeat_interval: 4h      # 未恢复的重复提醒间隔
+        routes:
+          # Watchdog（链路自检心跳）和 InfoInhibitor 永远 firing，丢黑洞不通知
+          - receiver: "null"
+            matchers: ['alertname =~ "Watchdog|InfoInhibitor"']
+      receivers:
+        - name: email
+          email_configs:
+            - to: 'xielc@obsbot.com'                # ← 收件人，逗号分隔可多个
+              send_resolved: true
+        - name: "null"           # 黑洞接收器：丢弃匹配到的告警
     service:
       type: NodePort
       nodePort: 30303
@@ -289,7 +336,8 @@ loki:
       repository: docker.io/nginxinc/nginx-unprivileged
       tag: "1.27.2-alpine"
     service:
-      type: ClusterIP
+      type: NodePort
+      nodePort: 30310   # 集群外系统（如夜莺）查询日志入口；不需要时可改回 ClusterIP
   chunksCache:
     enabled: false
   resultsCache:

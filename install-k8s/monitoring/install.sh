@@ -573,6 +573,22 @@ else:
 PY
 }
 
+# 由 config.yaml 的 secrets 段创建 k8s Secret（grafana.ini 的 smtp.password 用 $__env 引用 grafana-smtp）
+ensure_secrets() {
+  local pw
+  pw="$(python3 -c '
+import os, yaml
+cfg = yaml.safe_load(open(os.path.join(os.environ["DIR"], "config.yaml")))
+print((cfg.get("secrets") or {}).get("smtpPassword") or "")' 2>/dev/null)"
+  if [ -z "$pw" ] || [ "$pw" = "REPLACE_ME" ]; then
+    log "secrets.smtpPassword 未配置，跳过 grafana-smtp（Grafana 邮件告警不可用，Alertmanager 不受影响）"
+    return 0
+  fi
+  kubectl -n "$NS" create secret generic grafana-smtp \
+    --from-literal=password="$pw" --dry-run=client -o yaml | kubectl apply -f - \
+    && log "Secret grafana-smtp 已就绪"
+}
+
 apply_storage_manifests() {
   log "串行应用存储清单（storage.type=${STORAGE_TYPE}）"
   local f
@@ -930,6 +946,7 @@ install_all() {
     log "存储后端: nfs（静态 PV）"
   fi
   apply_storage_manifests
+  ensure_secrets
 
   log "更新 Helm 仓库"
   helm repo add prometheus-community https://prometheus-community.github.io/helm-charts 2>/dev/null || true
@@ -1058,6 +1075,11 @@ case "$cmd" in
   tempo)
     install_tempo
     ;;
+  gen)
+    # 只重新生成 .generated/（改了 config.yaml 后配合单独 helm upgrade 用）
+    need_py
+    gen
+    ;;
   destroy|uninstall|delete)
     destroy
     ;;
@@ -1074,7 +1096,7 @@ case "$cmd" in
     install_all
     ;;
   *)
-    echo "用法: bash install.sh [install|tempo|images|reinstall|destroy]"
+    echo "用法: bash install.sh [install|tempo|gen|images|reinstall|destroy]"
     exit 1
     ;;
 esac

@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sentinel
+  namespace: dev
+spec:
+  serviceName: sentinel
+  replicas: 3
+  selector:
+    matchLabels:
+      app: sentinel
+  template:
+    metadata:
+      labels:
+        app: sentinel
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: sentinel
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: sentinel
+          image: redis:7-alpine
+          command: ["/bin/sh", "/etc/sentinel-template/start.sh"]
+          ports:
+            - containerPort: 26379
+              name: sentinel
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-auth
+                  key: password
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: config-template
+              mountPath: /etc/sentinel-template
+              readOnly: true
+            - name: config-writable
+              mountPath: /etc/sentinel
+      volumes:
+        - name: config-template
+          configMap:
+            name: sentinel-config
+            defaultMode: 0755
+        - name: config-writable
+          emptyDir: {}
+        - name: data
+          emptyDir: {}

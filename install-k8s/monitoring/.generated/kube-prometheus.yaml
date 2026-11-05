@@ -13,6 +13,20 @@ grafana:
   grafana.ini:
     users:
       default_language: zh-Hans
+    smtp:
+      enabled: true
+      host: smtp.qq.com:587
+      user: starbucket@qq.com
+      password: $__env{SMTP_PASSWORD}
+      from_address: starbucket@qq.com
+      from_name: Grafana 监控告警
+      startTLS_policy: MandatoryStartTLS
+      skip_verify: true
+  envValueFrom:
+    SMTP_PASSWORD:
+      secretKeyRef:
+        name: grafana-smtp
+        key: password
   sidecar:
     image:
       registry: registry.cn-global.starbucket.com.cn/starbucket
@@ -67,6 +81,33 @@ grafana:
     type: Recreate
 alertmanager:
   enabled: true
+  config:
+    global:
+      smtp_smarthost: smtp.qq.com:587
+      smtp_from: starbucket@qq.com
+      smtp_auth_username: starbucket@qq.com
+      smtp_auth_password: rmqiqlrpysqpfdae
+      smtp_require_tls: true
+      resolve_timeout: 5m
+    route:
+      receiver: email
+      group_by:
+      - namespace
+      - alertname
+      - severity
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      routes:
+      - receiver: 'null'
+        matchers:
+        - alertname =~ "Watchdog|InfoInhibitor"
+    receivers:
+    - name: email
+      email_configs:
+      - to: xielc@obsbot.com
+        send_resolved: true
+    - name: 'null'
   service:
     type: NodePort
     nodePort: 30303

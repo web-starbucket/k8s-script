@@ -1,0 +1,69 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-config
+  namespace: dev
+data:
+  redis.conf.tpl: |
+    bind 0.0.0.0
+    protected-mode no
+    port 6379
+    dir /data
+    appendonly yes
+    appendfilename "appendonly.aof"
+    appendfsync everysec
+    aof-use-rdb-preamble yes
+    min-replicas-to-write 1
+    min-replicas-max-lag 10
+    requirepass __REDIS_PASSWORD__
+    masterauth __REDIS_PASSWORD__
+
+  start.sh: |
+    #!/bin/sh
+    set -e
+    export REDISCLI_AUTH="$REDIS_PASSWORD"
+
+    # 生成运行时配置
+    ESCAPED_PW=$(printf '%s' "$REDIS_PASSWORD" | sed -e 's/[\\&]/\\&/g')
+    sed "s|__REDIS_PASSWORD__|${ESCAPED_PW}|g" \
+      /etc/redis-template/redis.conf.tpl > /etc/redis/redis.conf
+    chmod 600 /etc/redis/redis.conf
+
+    # 启动 Redis
+    redis-server /etc/redis/redis.conf &
+    REDIS_PID=$!
+
+    # 等待本机 Redis 就绪
+    until redis-cli ping 2>/dev/null | grep -q PONG; do sleep 1; done
+
+    # 等待 Sentinel 可用（最多 60 秒）
+    SENTINEL_HOST="redis-sentinel.dev.svc.cluster.local"
+    SENTINEL_PORT=26379
+    MASTER_INFO=""
+    for i in $(seq 1 30); do
+      MASTER_INFO=$(redis-cli -h "$SENTINEL_HOST" -p "$SENTINEL_PORT" \
+        SENTINEL get-master-addr-by-name mymaster 2>/dev/null || true)
+      if [ -n "$MASTER_INFO" ]; then break; fi
+      sleep 2
+    done
+
+    MY_IP=$(hostname -i | awk '{print $1}')
+    MASTER_IP=$(echo "$MASTER_INFO" | head -1)
+
+    if [ -n "$MASTER_IP" ]; then
+      # Sentinel 已给出主节点，跟随
+      if [ "$MASTER_IP" != "$MY_IP" ]; then
+        ROLE=$(redis-cli info replication | grep role | cut -d: -f2 | tr -d '\r')
+        if [ "$ROLE" != "slave" ]; then
+          MASTER_PORT=$(echo "$MASTER_INFO" | tail -1)
+          redis-cli REPLICAOF "$MASTER_IP" "$MASTER_PORT"
+        fi
+      fi
+    else
+      # Sentinel 未就绪，按初始约定：redis-0 为主，其余为从
+      if [ "${HOSTNAME##*-}" != "0" ]; then
+        redis-cli REPLICAOF redis-0.redis.dev.svc.cluster.local 6379
+      fi
+    fi
+
+    wait $REDIS_PID
