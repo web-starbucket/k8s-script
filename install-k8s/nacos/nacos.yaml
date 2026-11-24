@@ -1,0 +1,196 @@
+# Nacos 2.4.3 cluster (3 nodes) with external MySQL and Ceph-independent database storage.
+# Create namespace and required Secrets as described in README.md before applying.
+# Internal client endpoint: nacos.nacos.svc.cluster.local:8848 (also exposes client gRPC 9848).
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nacos
+  labels:
+    app.kubernetes.io/name: nacos
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nacos-headless
+  namespace: nacos
+  labels:
+    app.kubernetes.io/name: nacos
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: nacos
+  ports:
+    - name: http
+      port: 8848
+      targetPort: http
+    - name: client-grpc
+      port: 9848
+      targetPort: client-grpc
+    - name: server-grpc
+      port: 9849
+      targetPort: server-grpc
+    - name: raft
+      port: 7848
+      targetPort: raft
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nacos
+  namespace: nacos
+  labels:
+    app.kubernetes.io/name: nacos
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: nacos
+  ports:
+    - name: http
+      port: 8848
+      targetPort: http
+    - name: client-grpc
+      port: 9848
+      targetPort: client-grpc
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: nacos
+  namespace: nacos
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nacos
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: nacos
+  namespace: nacos
+  labels:
+    app.kubernetes.io/name: nacos
+spec:
+  serviceName: nacos-headless
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nacos
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nacos
+    spec:
+      terminationGracePeriodSeconds: 60
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: nacos
+      containers:
+        - name: nacos
+          image: nacos/nacos-server:v2.4.3
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8848
+              protocol: TCP
+            - name: client-grpc
+              containerPort: 9848
+              protocol: TCP
+            - name: server-grpc
+              containerPort: 9849
+              protocol: TCP
+            - name: raft
+              containerPort: 7848
+              protocol: TCP
+          env:
+            - name: MODE
+              value: cluster
+            - name: PREFER_HOST_MODE
+              value: hostname
+            - name: NACOS_SERVERS
+              value: "nacos-0.nacos-headless.nacos.svc.cluster.local:8848 nacos-1.nacos-headless.nacos.svc.cluster.local:8848 nacos-2.nacos-headless.nacos.svc.cluster.local:8848"
+            - name: NACOS_APPLICATION_PORT
+              value: "8848"
+            - name: SPRING_DATASOURCE_PLATFORM
+              value: mysql
+            - name: MYSQL_SERVICE_HOST
+              value: mysql.default.svc.cluster.local
+            - name: MYSQL_SERVICE_PORT
+              value: "3306"
+            - name: MYSQL_SERVICE_DB_NAME
+              value: nacos_config
+            - name: MYSQL_SERVICE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: nacos-db-auth
+                  key: username
+            - name: MYSQL_SERVICE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nacos-db-auth
+                  key: password
+            - name: MYSQL_SERVICE_DB_PARAM
+              value: "characterEncoding=utf8&connectTimeout=1000&socketTimeout=3000&autoReconnect=true&useSSL=false&allowPublicKeyRetrieval=true"
+            - name: NACOS_AUTH_ENABLE
+              value: "true"
+            - name: NACOS_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: nacos-auth
+                  key: token
+            - name: NACOS_AUTH_IDENTITY_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nacos-auth
+                  key: identity-key
+            - name: NACOS_AUTH_IDENTITY_VALUE
+              valueFrom:
+                secretKeyRef:
+                  name: nacos-auth
+                  key: identity-value
+            - name: JVM_XMS
+              value: 1g
+            - name: JVM_XMX
+              value: 1g
+            - name: JVM_XMN
+              value: 512m
+          startupProbe:
+            httpGet:
+              path: /nacos/v1/console/health/liveness
+              port: http
+              scheme: HTTP
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /nacos/v1/console/health/readiness
+              port: http
+              scheme: HTTP
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /nacos/v1/console/health/liveness
+              port: http
+              scheme: HTTP
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi

@@ -1,0 +1,20 @@
+[Unit]
+Description=Incremental OSS to NFS static website sync
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=RCLONE_CONFIG_FILE=/etc/rclone/oss.conf
+Environment=OSS_SOURCE=oss:obsbot-static-resource-cn/website/obsbot-website/beta
+Environment=NFS_DEST=/data/nfs/shared/website/gray
+Environment=SYNC_INTERVAL_SECONDS=60
+WorkingDirectory=/opt/service/aliyun/oss
+ExecStart=/opt/service/aliyun/oss/oss-to-nfs-sync.sh
+Restart=always
+RestartSec=5
+User=oss-sync
+Group=oss-sync
+
+[Install]
+WantedBy=multi-user.target

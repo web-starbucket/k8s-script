@@ -1,0 +1,8 @@
+[oss]
+type = s3
+provider = Alibaba
+env_auth = false
+access_key_id = REPLACE_WITH_OSS_READONLY_ACCESS_KEY
+secret_access_key = REPLACE_WITH_OSS_READONLY_SECRET_KEY
+endpoint = oss-cn-chengdu.aliyuncs.com
+region = cn-chengdu

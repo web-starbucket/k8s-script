@@ -1,0 +1,41 @@
+# Static NFS PV/PVC for gray namespace website content.
+# NFS server-side export and firewall must be configured before applying.
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pv-nfs-gray-website
+  labels:
+    app.kubernetes.io/name: gray-website-static
+spec:
+  capacity:
+    storage: 100Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadOnlyMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  mountOptions:
+    - nfsvers=4.1
+    - hard
+    - timeo=600
+    - retrans=2
+  nfs:
+    server: 172.16.10.124
+    path: /data/nfs/shared/website/gray
+    readOnly: true
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-nfs-gray-website
+  namespace: gray
+spec:
+  accessModes:
+    - ReadOnlyMany
+  volumeMode: Filesystem
+  resources:
+    requests:
+      storage: 100Gi
+  volumeName: pv-nfs-gray-website
+  storageClassName: ""

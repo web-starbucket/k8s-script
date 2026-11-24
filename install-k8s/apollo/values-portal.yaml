@@ -1,0 +1,36 @@
+# Apollo Portal chart 0.12.0 / Apollo 3.0.0. Protect this file; DB password is stored in Helm release data.
+replicaCount: 2
+service:
+  type: ClusterIP
+  sessionAffinity: ClientIP
+portaldb:
+  host: mysql.default.svc.cluster.local
+  port: 3306
+  dbName: ApolloPortalDB
+  userName: apollo_portal
+  password: REPLACE_WITH_APOLLO_PORTAL_DB_PASSWORD
+  connectionStringProperties: characterEncoding=utf8&useSSL=false
+config:
+  profiles: "github,auth"
+  # K8s namespaces dev/gray/prod map to Apollo logical envs DEV/UAT/PRO.
+  envs: "dev,uat,pro"
+  metaServers:
+    dev: "http://apollo-service-dev-apollo-configservice.apollo-dev.svc.cluster.local:8080"
+    uat: "http://apollo-service-gray-apollo-configservice.apollo-gray.svc.cluster.local:8080"
+    pro: "http://apollo-service-prod-apollo-configservice.apollo-prod.svc.cluster.local:8080"
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          topologyKey: kubernetes.io/hostname
+          labelSelector:
+            matchLabels:
+              app: apollo-portal

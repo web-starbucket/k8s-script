@@ -1,0 +1,55 @@
+# Apollo Service chart 0.12.0 / Apollo 3.0.0, logical environment PRO.
+# Protect this file: chart renders DB credentials into ConfigMaps/Helm release data.
+configdb:
+  host: mysql.default.svc.cluster.local
+  port: 3306
+  dbName: ApolloConfigDB_PRO
+  userName: apollo_prod
+  password: CHANGE_ME
+  connectionStringProperties: characterEncoding=utf8&useSSL=false
+  service:
+    enabled: false
+configService:
+  replicaCount: 2
+  image:
+    tag: "3.0.0"
+  config:
+    profiles: "github,kubernetes"
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels:
+                app: apollo-service-prod-apollo-configservice
+adminService:
+  replicaCount: 2
+  image:
+    tag: "3.0.0"
+  config:
+    profiles: "github,kubernetes"
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels:
+                app: apollo-service-prod-apollo-adminservice
