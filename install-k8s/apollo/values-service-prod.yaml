@@ -1,8 +1,8 @@
 # Apollo Service chart 0.12.0 / Apollo 3.0.0, logical environment PRO.
 # Protect this file: chart renders DB credentials into ConfigMaps/Helm release data.
 configdb:
-  host: mysql.default.svc.cluster.local
-  port: 3306
+  host: mysql-cluster.prod.svc.cluster.local
+  port: 6446
   dbName: ApolloConfigDB_PRO
   userName: apollo_prod
   password: CHANGE_ME
@@ -12,6 +12,7 @@ configdb:
 configService:
   replicaCount: 2
   image:
+    repository: registry.cn-global.starbucket.com.cn/starbucket/docker.io/apolloconfig/apollo-configservice
     tag: "3.0.0"
   config:
     profiles: "github,kubernetes"
@@ -34,6 +35,7 @@ configService:
 adminService:
   replicaCount: 2
   image:
+    repository: registry.cn-global.starbucket.com.cn/starbucket/docker.io/apolloconfig/apollo-adminservice
     tag: "3.0.0"
   config:
     profiles: "github,kubernetes"

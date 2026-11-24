@@ -1,11 +1,15 @@
 # Apollo Portal chart 0.12.0 / Apollo 3.0.0. Protect this file; DB password is stored in Helm release data.
 replicaCount: 2
+image:
+  repository: registry.cn-global.starbucket.com.cn/starbucket/docker.io/apolloconfig/apollo-portal
+  tag: "3.0.0"
+  pullPolicy: IfNotPresent
 service:
   type: ClusterIP
   sessionAffinity: ClientIP
 portaldb:
-  host: mysql.default.svc.cluster.local
-  port: 3306
+  host: mysql-cluster.prod.svc.cluster.local
+  port: 6446
   dbName: ApolloPortalDB
   userName: apollo_portal
   password: REPLACE_WITH_APOLLO_PORTAL_DB_PASSWORD
@@ -15,9 +19,9 @@ config:
   # K8s namespaces dev/gray/prod map to Apollo logical envs DEV/UAT/PRO.
   envs: "dev,uat,pro"
   metaServers:
-    dev: "http://apollo-service-dev-apollo-configservice.apollo-dev.svc.cluster.local:8080"
-    uat: "http://apollo-service-gray-apollo-configservice.apollo-gray.svc.cluster.local:8080"
-    pro: "http://apollo-service-prod-apollo-configservice.apollo-prod.svc.cluster.local:8080"
+    dev: "http://apollo-service-dev-apollo-configservice.prod.svc.cluster.local:8080"
+    uat: "http://apollo-service-gray-apollo-configservice.prod.svc.cluster.local:8080"
+    pro: "http://apollo-service-prod-apollo-configservice.prod.svc.cluster.local:8080"
 resources:
   requests:
     cpu: 250m

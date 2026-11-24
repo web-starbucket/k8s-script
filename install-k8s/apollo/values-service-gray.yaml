@@ -1,9 +1,9 @@
-# Kubernetes namespace gray maps to Apollo's built-in logical environment UAT.
+# Installed into K8s namespace prod; this release serves Apollo's built-in logical environment UAT for gray workloads.
 # Apollo Service chart 0.12.0 / Apollo app 3.0.0.
 # Protect this file: chart renders DB credentials into ConfigMaps/Helm release data.
 configdb:
-  host: mysql.default.svc.cluster.local
-  port: 3306
+  host: mysql-cluster.prod.svc.cluster.local
+  port: 6446
   dbName: ApolloConfigDB_GRAY
   userName: apollo_gray
   password: CHANGE_ME
@@ -13,6 +13,7 @@ configdb:
 configService:
   replicaCount: 2
   image:
+    repository: registry.cn-global.starbucket.com.cn/starbucket/docker.io/apolloconfig/apollo-configservice
     tag: "3.0.0"
   config:
     profiles: "github,kubernetes"
@@ -35,6 +36,7 @@ configService:
 adminService:
   replicaCount: 2
   image:
+    repository: registry.cn-global.starbucket.com.cn/starbucket/docker.io/apolloconfig/apollo-adminservice
     tag: "3.0.0"
   config:
     profiles: "github,kubernetes"
